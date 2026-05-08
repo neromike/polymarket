@@ -1,0 +1,2 @@
+conditionId,question,slug,eventSlug,closed,active,closedTime,endDate,winner,winningOutcomeIndex,outcomes,outcomePrices,clobTokenIds,liquidityNum,volumeNum,volume24hr,umaResolutionStatus
+0x81fb3e948db1f5645556dbc01b96f50c319f1331ce8b745701197b8264c1d344,Iran Nuke in 2025?,iran-nuke-in-2025,,True,True,2026-01-01 08:38:49+00,2025-12-31T12:00:00Z,,,"[""Yes"", ""No""]","[""0"", ""1""]","[""43541906415508679325276246713350983384464924175917785722017487178637607801263"", ""42088475271240543453547185258418176791428175519469427479319814497153066494553""]",,1523164.37993,,resolved
