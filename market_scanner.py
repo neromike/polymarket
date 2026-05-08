@@ -4,6 +4,7 @@ import argparse
 import csv
 import math
 import sys
+from datetime import datetime, timezone
 from bisect import bisect_left
 from collections import defaultdict
 from dataclasses import dataclass
@@ -42,6 +43,8 @@ class JumpEvent:
     volume_during_jump: float
     volume_before_jump: float
     price_window_seconds: int
+    market_score: float = 0.0
+    cluster_id: str = ""
 
 
 def parse_args() -> argparse.Namespace:
@@ -103,6 +106,61 @@ def parse_args() -> argparse.Namespace:
         help="Optional cap on markets scanned (0 means no cap)",
     )
     parser.add_argument(
+        "--market-candidates-csv",
+        default="reports/market_discovery/candidate_markets.csv",
+        help=(
+            "Optional market-discovery output CSV with per-market scores "
+            "(default: reports/market_discovery/candidate_markets.csv)"
+        ),
+    )
+    parser.add_argument(
+        "--min-market-score",
+        type=float,
+        default=0.0,
+        help="Minimum market_score required from discovery CSV (default: 0.0)",
+    )
+    parser.add_argument(
+        "--market-score-weight",
+        type=float,
+        default=0.8,
+        help=(
+            "How strongly discovery market_score scales event/user captures. "
+            "0 disables score-based scaling (default: 0.8)"
+        ),
+    )
+    parser.add_argument(
+        "--event-cluster-window",
+        default="24h",
+        help=(
+            "Cluster width used to de-duplicate related markets in same event into "
+            "independent information events (default: 24h)"
+        ),
+    )
+    parser.add_argument(
+        "--min-independent-events",
+        type=int,
+        default=2,
+        help="Minimum independent event clusters to classify beyond low confidence (default: 2)",
+    )
+    parser.add_argument(
+        "--max-single-event-share",
+        type=float,
+        default=0.65,
+        help=(
+            "If one event contributes over this share of total capture, lower confidence "
+            "(default: 0.65)"
+        ),
+    )
+    parser.add_argument(
+        "--min-directional-ratio",
+        type=float,
+        default=0.10,
+        help=(
+            "Minimum directional exposure ratio to count an event as informational "
+            "(downweights market-maker-like symmetric flow, default: 0.10)"
+        ),
+    )
+    parser.add_argument(
         "--sleep",
         type=float,
         default=0.05,
@@ -154,6 +212,50 @@ def logit(p: float) -> float:
 
 def normal_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def slugify_text(value: str) -> str:
+    text = "".join(ch.lower() if ch.isalnum() else "_" for ch in str(value or ""))
+    text = "_".join(part for part in text.split("_") if part)
+    return text or "unknown"
+
+
+def market_score_multiplier(score: float, weight: float) -> float:
+    # Keep scaling bounded and monotonic around neutral score=0.5.
+    if weight <= 0:
+        return 1.0
+    mult = 1.0 + weight * (score - 0.5)
+    return max(0.5, min(1.5, mult))
+
+
+def load_market_candidates(path: Path) -> Dict[str, Dict[str, float]]:
+    if not path.exists():
+        return {}
+
+    out: Dict[str, Dict[str, float]] = {}
+    try:
+        with path.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                cid = str(row.get("conditionId") or "")
+                if not cid:
+                    continue
+                out[cid] = {
+                    "market_score": safe_float(row.get("market_score")) or 0.0,
+                    "private_decision_score": safe_float(row.get("private_decision_score")) or 0.0,
+                    "tradability_score": safe_float(row.get("tradability_score")) or 0.0,
+                    "data_quality_score": safe_float(row.get("data_quality_score")) or 0.0,
+                }
+    except OSError as exc:
+        print(f"Failed to read market candidates {path}: {exc}", file=sys.stderr)
+        return {}
+    return out
+
+
+def build_event_cluster_id(event: JumpEvent, cluster_window_seconds: int) -> str:
+    base = event.event_slug or event.slug or event.condition_id
+    bucket = int(event.jump_time) // max(1, cluster_window_seconds)
+    return f"{slugify_text(base)}:{bucket}"
 
 
 def load_markets(data_dir: Path) -> Dict[str, MarketInfo]:
@@ -432,13 +534,16 @@ def event_user_captures(
 
         for wallet, q_sum in per_user_q.items():
             capture = q_sum * event.delta_p
+            gross_notional = per_user_notional.get(wallet, 0.0)
+            directional_ratio = abs(q_sum) / gross_notional if gross_notional > 0 else 0.0
             row = by_user.get(wallet)
             if row is None or abs(capture) > abs(row["jump_capture"]):
                 by_user[wallet] = {
                     "wallet": wallet,
                     "jump_capture": capture,
                     "signed_exposure": q_sum,
-                    "gross_notional": per_user_notional.get(wallet, 0.0),
+                    "gross_notional": gross_notional,
+                    "directional_ratio": directional_ratio,
                     "chosen_lookback_seconds": lookback,
                 }
     return by_user
@@ -456,6 +561,19 @@ def main() -> None:
 
     price_window_seconds = parse_duration_seconds(args.price_window)
     tau_seconds = float(parse_duration_seconds(args.tau))
+    cluster_window_seconds = parse_duration_seconds(args.event_cluster_window)
+
+    candidate_scores = load_market_candidates(Path(args.market_candidates_csv))
+    if candidate_scores:
+        print(
+            f"Loaded discovery scores for {len(candidate_scores)} markets from {args.market_candidates_csv}",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "No market discovery CSV loaded; proceeding with neutral market scores.",
+            file=sys.stderr,
+        )
 
     markets = load_markets(data_dir)
     if not markets:
@@ -476,6 +594,14 @@ def main() -> None:
 
     events: List[JumpEvent] = []
     market_ids = sorted(markets.keys())
+
+    if candidate_scores and args.min_market_score > 0:
+        market_ids = [
+            cid
+            for cid in market_ids
+            if (candidate_scores.get(cid, {}).get("market_score", 0.0) >= args.min_market_score)
+        ]
+
     if args.max_markets > 0:
         market_ids = market_ids[: args.max_markets]
 
@@ -495,6 +621,10 @@ def main() -> None:
             min_abs_move=args.min_abs_move,
             jump_sigma_mult=args.jump_sigma_mult,
         )
+        market_score = candidate_scores.get(condition_id, {}).get("market_score", 0.0)
+        for evt in candidates:
+            evt.market_score = market_score
+            evt.cluster_id = build_event_cluster_id(evt, cluster_window_seconds)
         events.extend(candidates)
 
         if scanned % 100 == 0 or scanned == len(market_ids):
@@ -553,11 +683,13 @@ def main() -> None:
         event_rows.append(
             {
                 "event_id": event.event_id,
+                "cluster_id": event.cluster_id,
                 "condition_id": event.condition_id,
                 "question": event.question,
                 "slug": event.slug,
                 "event_slug": event.event_slug,
                 "jump_time": int(event.jump_time),
+                "jump_time_utc": datetime.fromtimestamp(event.jump_time, tz=timezone.utc).isoformat(),
                 "p_before": event.p_before,
                 "p_after": event.p_after,
                 "delta_p": event.delta_p,
@@ -566,21 +698,34 @@ def main() -> None:
                 "volume_during_jump": event.volume_during_jump,
                 "volume_before_jump": event.volume_before_jump,
                 "price_window_seconds": event.price_window_seconds,
+                "market_score": event.market_score,
                 "participants": len(per_user),
             }
         )
 
         for wallet, rec in per_user.items():
-            capture = float(rec["jump_capture"])
+            directional_ratio = safe_float(rec.get("directional_ratio")) or 0.0
+            directional_weight = min(1.0, directional_ratio / max(args.min_directional_ratio, 1e-6))
+
+            base_capture = float(rec["jump_capture"])
+            market_mult = market_score_multiplier(event.market_score, args.market_score_weight)
+            capture = base_capture * market_mult * directional_weight
+
             captures_by_event[event.event_id].append((wallet, capture))
             user_event_rows.append(
                 {
                     "event_id": event.event_id,
+                    "cluster_id": event.cluster_id,
                     "condition_id": event.condition_id,
                     "wallet": wallet,
                     "jump_capture": capture,
+                    "raw_jump_capture": base_capture,
                     "signed_exposure": rec["signed_exposure"],
                     "gross_notional": rec["gross_notional"],
+                    "directional_ratio": directional_ratio,
+                    "directional_weight": directional_weight,
+                    "market_score": event.market_score,
+                    "market_score_multiplier": market_mult,
                     "chosen_lookback_seconds": rec["chosen_lookback_seconds"],
                     "jump_time": int(event.jump_time),
                     "delta_p": event.delta_p,
@@ -615,9 +760,13 @@ def main() -> None:
             "total_jump_capture": 0.0,
             "gross_notional": 0.0,
             "event_ids": set(),
+            "cluster_ids": set(),
+            "cluster_best": {},
             "z_parts": [],
             "jumps_captured": 0,
             "max_single_event_contribution": 0.0,
+            "avg_directional_ratio": 0.0,
+            "_directional_count": 0,
         }
     )
 
@@ -625,6 +774,7 @@ def main() -> None:
         wallet = str(row["wallet"])
         capture = safe_float(row.get("jump_capture")) or 0.0
         event_id = str(row["event_id"])
+        cluster_id = str(row.get("cluster_id") or event_id)
         mu, sd = event_stats.get(event_id, (0.0, 0.0))
         z = (capture - mu) / sd if sd > 0 else 0.0
 
@@ -633,17 +783,31 @@ def main() -> None:
         rec["total_jump_capture"] += capture
         rec["gross_notional"] += safe_float(row.get("gross_notional")) or 0.0
         rec["event_ids"].add(event_id)
+        rec["cluster_ids"].add(cluster_id)
         rec["z_parts"].append(z)
-        if capture > 0:
+        if capture > 0 and (safe_float(row.get("directional_ratio")) or 0.0) >= args.min_directional_ratio:
             rec["jumps_captured"] += 1
         rec["max_single_event_contribution"] = max(
             rec["max_single_event_contribution"],
             abs(capture),
         )
 
+        rec["avg_directional_ratio"] += safe_float(row.get("directional_ratio")) or 0.0
+        rec["_directional_count"] += 1
+
+        # Keep only the strongest event per cluster to avoid over-counting related markets.
+        best = rec["cluster_best"].get(cluster_id)
+        if best is None or abs(capture) > abs(best["capture"]):
+            rec["cluster_best"][cluster_id] = {
+                "capture": capture,
+                "z": z,
+                "event_id": event_id,
+            }
+
     candidates: List[Dict[str, Any]] = []
     for wallet, rec in user_acc.items():
-        z_parts = rec["z_parts"]
+        cluster_best = rec["cluster_best"]
+        z_parts = [float(v["z"]) for v in cluster_best.values()]
         n = len(z_parts)
         if n == 0:
             continue
@@ -651,9 +815,26 @@ def main() -> None:
         timing_z = mean_z * math.sqrt(n)
         timing_index = 100.0 * normal_cdf(timing_z)
 
-        event_count = len(rec["event_ids"])
+        event_count = len(cluster_best)
+
+        capped_total_capture = sum(float(v["capture"]) for v in cluster_best.values())
+        max_cluster_capture = max((abs(float(v["capture"])) for v in cluster_best.values()), default=0.0)
+        max_single_event_share = (
+            max_cluster_capture / abs(capped_total_capture)
+            if abs(capped_total_capture) > 1e-9
+            else 1.0
+        )
+
+        avg_directional_ratio = (
+            rec["avg_directional_ratio"] / rec["_directional_count"]
+            if rec["_directional_count"] > 0
+            else 0.0
+        )
+
         confidence = "low"
-        if event_count >= 10 and timing_z >= 5.0:
+        if event_count < args.min_independent_events:
+            confidence = "low"
+        elif event_count >= 10 and timing_z >= 5.0:
             confidence = "very_high"
         elif event_count >= 5 and timing_z >= 4.0:
             confidence = "high"
@@ -662,16 +843,29 @@ def main() -> None:
         elif event_count >= 2 and timing_z >= 2.0:
             confidence = "monitor"
 
+        if max_single_event_share > args.max_single_event_share:
+            if confidence == "very_high":
+                confidence = "high"
+            elif confidence == "high":
+                confidence = "candidate"
+            elif confidence == "candidate":
+                confidence = "monitor"
+            else:
+                confidence = "low"
+
         candidates.append(
             {
                 "wallet": wallet,
                 "total_jump_capture": rec["total_jump_capture"],
+                "cluster_capped_total_jump_capture": capped_total_capture,
                 "timing_z": timing_z,
                 "timing_index": timing_index,
                 "number_of_jumps_captured": rec["jumps_captured"],
                 "number_of_independent_events": event_count,
                 "max_single_event_contribution": rec["max_single_event_contribution"],
+                "max_single_event_share": max_single_event_share,
                 "gross_notional": rec["gross_notional"],
+                "avg_directional_ratio": avg_directional_ratio,
                 "confidence_level": confidence,
             }
         )
