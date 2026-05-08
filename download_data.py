@@ -76,6 +76,27 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Always refetch and rewrite price-history files.",
     )
+    parser.add_argument(
+        "--candidates-csv",
+        default="reports/market_scanner/candidate_users.csv",
+        help=(
+            "Scanner output CSV used to auto-seed users when --user is omitted "
+            "(default: reports/market_scanner/candidate_users.csv)"
+        ),
+    )
+    parser.add_argument(
+        "--candidate-confidences",
+        default="high,very_high",
+        help=(
+            "Comma-separated confidence levels to auto-seed from candidates CSV "
+            "(default: high,very_high)"
+        ),
+    )
+    parser.add_argument(
+        "--no-seed-from-candidates",
+        action="store_true",
+        help="Disable automatic seeding of data/user folders from scanner candidates CSV.",
+    )
     return parser.parse_args()
 
 
@@ -121,6 +142,64 @@ def sanitize_file_component(value: Any, fallback: str = "row") -> str:
     if not text:
         text = fallback
     return text[:140]
+
+
+def parse_confidence_levels(value: str) -> Set[str]:
+    levels = {x.strip().lower() for x in str(value or "").split(",") if x.strip()}
+    return levels or {"high", "very_high"}
+
+
+def load_candidate_wallets(candidates_csv: Path, accepted_confidences: Set[str]) -> List[str]:
+    if not candidates_csv.exists():
+        return []
+
+    wallets: List[str] = []
+    seen: Set[str] = set()
+    try:
+        with candidates_csv.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                confidence = str(row.get("confidence_level") or "").strip().lower()
+                if confidence not in accepted_confidences:
+                    continue
+                wallet = str(row.get("wallet") or "").strip()
+                if not wallet:
+                    continue
+                wallet_l = wallet.lower()
+                if wallet_l in seen:
+                    continue
+                seen.add(wallet_l)
+                wallets.append(wallet)
+    except OSError as exc:
+        print(f"Failed reading candidates CSV {candidates_csv}: {exc}", file=sys.stderr)
+        return []
+
+    return wallets
+
+
+def seed_user_dirs_from_candidates(
+    data_dir: Path,
+    candidates_csv: Path,
+    accepted_confidences: Set[str],
+) -> Tuple[int, int]:
+    wallets = load_candidate_wallets(candidates_csv, accepted_confidences)
+    if not wallets:
+        return 0, 0
+
+    users_dir = data_dir / "user"
+    users_dir.mkdir(parents=True, exist_ok=True)
+
+    created = 0
+    existing = 0
+    for wallet in wallets:
+        folder = users_dir / sanitize_file_component(wallet, fallback="wallet")
+        if folder.exists():
+            existing += 1
+            continue
+        folder.mkdir(parents=True, exist_ok=True)
+        created += 1
+
+    return created, existing
 
 
 def build_record_key(row: Dict[str, Any], key_fields: Sequence[str], idx: int) -> str:
@@ -567,6 +646,31 @@ def main() -> None:
     args = parse_args()
     cfg = AnalyzerConfig(sleep_between_requests=args.sleep)
     data_dir = Path(args.data_dir)
+
+    if not args.user and not args.no_seed_from_candidates:
+        accepted_confidences = parse_confidence_levels(args.candidate_confidences)
+        created, existing = seed_user_dirs_from_candidates(
+            data_dir,
+            Path(args.candidates_csv),
+            accepted_confidences,
+        )
+        if created or existing:
+            print(
+                (
+                    f"Auto-seeded users from {args.candidates_csv}: "
+                    f"created={created}, already_present={existing}, "
+                    f"confidences={','.join(sorted(accepted_confidences))}"
+                ),
+                file=sys.stderr,
+            )
+        else:
+            print(
+                (
+                    f"No users auto-seeded from {args.candidates_csv}. "
+                    "Run market_scanner.py first or adjust --candidate-confidences."
+                ),
+                file=sys.stderr,
+            )
 
     if args.user:
         users = [u.strip() for u in args.user if str(u).strip()]
