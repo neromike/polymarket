@@ -1,1 +1,0 @@
-SkillIndex uses a randomized-side proxy baseline; treat as approximate unless replaced by matched-trade bootstrap
