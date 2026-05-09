@@ -1,0 +1,21 @@
+# Generated data
+/data/
+data/
+
+# Generated reports, optional
+/reports/
+reports/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local environment files
+.env
+.env.*
