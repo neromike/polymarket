@@ -7,7 +7,7 @@ import sys
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from api import ApiError, PolymarketClient
 from cli import write_csv
@@ -75,11 +75,6 @@ def parse_args() -> argparse.Namespace:
         description="Discover and cache high-value Polymarket markets for jump-first user scanning."
     )
     parser.add_argument("--data-dir", default="data", help="Workspace data directory (default: data)")
-    parser.add_argument(
-        "--out-dir",
-        default="reports/market_discovery",
-        help="Output directory for discovery artifacts (default: reports/market_discovery)",
-    )
     parser.add_argument("--limit-pages", type=int, default=10, help="Max pages from /markets/keyset")
     parser.add_argument("--page-size", type=int, default=500, help="Rows per /markets/keyset page")
     parser.add_argument(
@@ -122,6 +117,16 @@ def parse_args() -> argparse.Namespace:
         "--skip-price-history",
         action="store_true",
         help="Skip CLOB price-history caching",
+    )
+    parser.add_argument(
+        "--force-market-refresh",
+        action="store_true",
+        help="Rewrite cached market metadata even when market cache file exists.",
+    )
+    parser.add_argument(
+        "--force-price-refresh",
+        action="store_true",
+        help="Refetch and rewrite price-history files even when monthly cache files exist.",
     )
     return parser.parse_args()
 
@@ -320,17 +325,38 @@ def month_key_for_market(market: Dict[str, Any]) -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m")
 
 
-def write_market_cache(data_dir: Path, market: Dict[str, Any]) -> None:
+def load_cached_condition_ids(data_dir: Path) -> Set[str]:
+    markets_root = data_dir / "market" / "markets"
+    if not markets_root.exists():
+        return set()
+
+    cached: Set[str] = set()
+    for csv_file in markets_root.rglob("market_*.csv"):
+        stem = csv_file.stem
+        if not stem.startswith("market_"):
+            continue
+        condition_id = stem[len("market_") :].strip().lower()
+        if CONDITION_RE.match(condition_id):
+            cached.add(condition_id)
+    return cached
+
+
+def market_cache_path(data_dir: Path, market: Dict[str, Any]) -> Optional[Path]:
     condition_id = str(market.get("conditionId") or "")
     if not condition_id:
-        return
-
+        return None
     month = month_key_for_market(market)
     out_dir = data_dir / "market" / "markets" / month
-    out_path = out_dir / f"market_{sanitize_file_component(condition_id)}.csv"
+    return out_dir / f"market_{sanitize_file_component(condition_id)}.csv"
+
+
+def write_market_cache(data_dir: Path, market: Dict[str, Any]) -> None:
+    out_path = market_cache_path(data_dir, market)
+    if out_path is None:
+        return
 
     row = flatten_market_row(market)
-    row["conditionId"] = condition_id
+    row["conditionId"] = str(market.get("conditionId") or "")
     write_csv(out_path, [row])
 
 
@@ -341,6 +367,40 @@ def iter_token_ids(market: Dict[str, Any]) -> Iterable[str]:
             yield token
 
 
+def months_in_window(start_ts: int, end_ts: int) -> Set[str]:
+    if end_ts < start_ts:
+        return set()
+    start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
+    end_dt = datetime.fromtimestamp(end_ts, tz=timezone.utc)
+    cur = datetime(start_dt.year, start_dt.month, 1, tzinfo=timezone.utc)
+    out: Set[str] = set()
+    while cur <= end_dt:
+        out.add(cur.strftime("%Y-%m"))
+        if cur.month == 12:
+            cur = datetime(cur.year + 1, 1, 1, tzinfo=timezone.utc)
+        else:
+            cur = datetime(cur.year, cur.month + 1, 1, tzinfo=timezone.utc)
+    return out
+
+
+def token_price_history_cached(
+    data_dir: Path,
+    token_id: str,
+    start_ts: int,
+    end_ts: int,
+) -> bool:
+    needed_months = months_in_window(start_ts, end_ts)
+    if not needed_months:
+        return False
+
+    file_name = f"price_history_asset_{sanitize_file_component(token_id, 'asset')}.csv"
+    for month in needed_months:
+        out_path = data_dir / "market" / "prices-history" / month / file_name
+        if not out_path.exists():
+            return False
+    return True
+
+
 def write_price_history_cache(
     client: PolymarketClient,
     data_dir: Path,
@@ -348,10 +408,13 @@ def write_price_history_cache(
     *,
     fidelity_minutes: int,
     window_days: int,
-) -> None:
+) -> Tuple[int, int]:
     condition_id = str(market.get("conditionId") or "")
     now_ts = unix_now()
     start_ts = now_ts - max(1, window_days) * 86400
+
+    written_files = 0
+    tokens_with_data = 0
 
     for token_id in iter_token_ids(market):
         try:
@@ -390,29 +453,12 @@ def write_price_history_cache(
             out_dir = data_dir / "market" / "prices-history" / month
             out_path = out_dir / f"price_history_asset_{sanitize_file_component(token_id, 'asset')}.csv"
             write_csv(out_path, rows)
+            written_files += 1
 
+        if by_month:
+            tokens_with_data += 1
 
-def candidate_row(market: Dict[str, Any], features: Dict[str, float]) -> Dict[str, Any]:
-    return {
-        "market_score": features["market_score"],
-        "private_decision_score": features["private_decision_score"],
-        "discrete_jump_score": features["discrete_jump_score"],
-        "tradability_score": features["tradability_score"],
-        "data_quality_score": features["data_quality_score"],
-        "resolution_clarity_score": features["resolution_clarity_score"],
-        "diversity_score": features["diversity_score"],
-        "sports_penalty": features["sports_penalty"],
-        "conditionId": market.get("conditionId"),
-        "question": market.get("question"),
-        "slug": market.get("slug"),
-        "eventSlug": market.get("eventSlug"),
-        "category": market.get("category"),
-        "volumeNum": market.get("volumeNum"),
-        "liquidityNum": market.get("liquidityNum"),
-        "endDate": market.get("endDate"),
-        "closed": market.get("closed"),
-        "active": market.get("active"),
-    }
+    return written_files, tokens_with_data
 
 
 def main() -> None:
@@ -421,8 +467,6 @@ def main() -> None:
     client = PolymarketClient(cfg)
 
     data_dir = Path(args.data_dir)
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     markets = fetch_markets_keyset(
         client,
@@ -432,9 +476,28 @@ def main() -> None:
         min_volume=args.min_volume,
         min_liquidity=args.min_liquidity,
     )
+
+    cached_condition_ids = set()
+    if not args.force_market_refresh:
+        cached_condition_ids = load_cached_condition_ids(data_dir)
+        if cached_condition_ids:
+            before = len(markets)
+            markets = [
+                m
+                for m in markets
+                if str(m.get("conditionId") or "").strip().lower() not in cached_condition_ids
+            ]
+            skipped = before - len(markets)
+            print(
+                (
+                    f"Filtered cached markets from discovery set: skipped={skipped}, "
+                    f"remaining_new_candidates={len(markets)}"
+                ),
+                file=sys.stderr,
+            )
+
     if not markets:
         print("No markets fetched from Gamma keyset endpoint.", file=sys.stderr)
-        write_csv(out_dir / "candidate_markets.csv", [])
         return
 
     diversity = diversity_scores(markets)
@@ -454,23 +517,59 @@ def main() -> None:
 
     scored.sort(key=lambda x: x[1]["market_score"], reverse=True)
     selected = scored[: max(0, args.max_markets)] if args.max_markets > 0 else scored
+    print(f"Selected {len(selected)} new markets for caching.", file=sys.stderr)
 
-    write_csv(out_dir / "candidate_markets.csv", [candidate_row(m, f) for m, f in selected])
-    print(f"Selected {len(selected)} markets. Wrote candidate CSV to {out_dir / 'candidate_markets.csv'}")
+    market_written = 0
+    market_skipped_cached = 0
+    price_files_written = 0
+    price_tokens_skipped_cached = 0
 
     for idx, (market, _) in enumerate(selected, start=1):
-        write_market_cache(data_dir, market)
+        m_path = market_cache_path(data_dir, market)
+        if m_path is not None and m_path.exists() and not args.force_market_refresh:
+            market_skipped_cached += 1
+        else:
+            write_market_cache(data_dir, market)
+            market_written += 1
+
         if not args.skip_price_history:
-            write_price_history_cache(
-                client,
-                data_dir,
-                market,
-                fidelity_minutes=args.price_fidelity_minutes,
-                window_days=args.price_window_days,
-            )
+            now_ts = unix_now()
+            start_ts = now_ts - max(1, args.price_window_days) * 86400
+
+            tokens_to_fetch: List[str] = []
+            for token_id in iter_token_ids(market):
+                if args.force_price_refresh:
+                    tokens_to_fetch.append(token_id)
+                elif token_price_history_cached(data_dir, token_id, start_ts, now_ts):
+                    price_tokens_skipped_cached += 1
+                else:
+                    tokens_to_fetch.append(token_id)
+
+            if tokens_to_fetch:
+                market_for_prices = dict(market)
+                market_for_prices["clobTokenIds"] = tokens_to_fetch
+                written, _ = write_price_history_cache(
+                    client,
+                    data_dir,
+                    market_for_prices,
+                    fidelity_minutes=args.price_fidelity_minutes,
+                    window_days=args.price_window_days,
+                )
+                price_files_written += written
 
         if idx % 25 == 0 or idx == len(selected):
             print(f"Cached {idx}/{len(selected)} selected markets", file=sys.stderr)
+
+    print(
+        (
+            "Discovery cache summary: "
+            f"markets_written={market_written}, "
+            f"markets_skipped_cached={market_skipped_cached}, "
+            f"price_files_written={price_files_written}, "
+            f"price_tokens_skipped_cached={price_tokens_skipped_cached}"
+        ),
+        file=sys.stderr,
+    )
 
 
 if __name__ == "__main__":

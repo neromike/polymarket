@@ -9,7 +9,7 @@ from bisect import bisect_left
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from api import PolymarketClient, fetch_paginated
 from cli import write_csv
@@ -43,7 +43,6 @@ class JumpEvent:
     volume_during_jump: float
     volume_before_jump: float
     price_window_seconds: int
-    market_score: float = 0.0
     cluster_id: str = ""
 
 
@@ -106,27 +105,30 @@ def parse_args() -> argparse.Namespace:
         help="Optional cap on markets scanned (0 means no cap)",
     )
     parser.add_argument(
-        "--market-candidates-csv",
-        default="reports/market_discovery/candidate_markets.csv",
+        "--market",
+        action="append",
         help=(
-            "Optional market-discovery output CSV with per-market scores "
-            "(default: reports/market_discovery/candidate_markets.csv)"
+            "Optional specific market target(s): conditionId or slug. "
+            "Repeatable. If omitted, scans all cached markets."
         ),
     )
     parser.add_argument(
-        "--min-market-score",
-        type=float,
-        default=0.0,
-        help="Minimum market_score required from discovery CSV (default: 0.0)",
+        "--market-trades-cache-dir",
+        default="market/trades",
+        help=(
+            "Relative path under data-dir for cached market trades "
+            "(default: market/trades)"
+        ),
     )
     parser.add_argument(
-        "--market-score-weight",
-        type=float,
-        default=0.8,
-        help=(
-            "How strongly discovery market_score scales event/user captures. "
-            "0 disables score-based scaling (default: 0.8)"
-        ),
+        "--refresh-market-trades",
+        action="store_true",
+        help="Force full market-trade refresh from API for scanned markets.",
+    )
+    parser.add_argument(
+        "--no-api",
+        action="store_true",
+        help="Do not call APIs. Use only cached market trades in data/market/trades.",
     )
     parser.add_argument(
         "--event-cluster-window",
@@ -220,36 +222,130 @@ def slugify_text(value: str) -> str:
     return text or "unknown"
 
 
-def market_score_multiplier(score: float, weight: float) -> float:
-    # Keep scaling bounded and monotonic around neutral score=0.5.
-    if weight <= 0:
-        return 1.0
-    mult = 1.0 + weight * (score - 0.5)
-    return max(0.5, min(1.5, mult))
+def trade_uid(trade: Dict[str, Any], idx: int = 0) -> str:
+    tid = str(trade.get("id") or "").strip()
+    if tid:
+        return tid
+    txhash = str(trade.get("transactionHash") or "").strip()
+    if txhash:
+        return txhash
+    pieces = [
+        str(trade.get("conditionId") or ""),
+        str(trade.get("asset") or ""),
+        str(trade.get("side") or ""),
+        str(trade.get("timestamp") or ""),
+        str(trade.get("price") or ""),
+        str(trade.get("size") or ""),
+        str(idx),
+    ]
+    return "|".join(pieces)
 
 
-def load_market_candidates(path: Path) -> Dict[str, Dict[str, float]]:
+def market_trade_cache_path(data_dir: Path, cache_dir: str, condition_id: str) -> Path:
+    return data_dir / cache_dir / condition_id / "trades.csv"
+
+
+def load_cached_market_trades(data_dir: Path, cache_dir: str, condition_id: str) -> List[Dict[str, Any]]:
+    path = market_trade_cache_path(data_dir, cache_dir, condition_id)
     if not path.exists():
-        return {}
-
-    out: Dict[str, Dict[str, float]] = {}
+        return []
     try:
         with path.open("r", newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
-            for row in reader:
-                cid = str(row.get("conditionId") or "")
-                if not cid:
-                    continue
-                out[cid] = {
-                    "market_score": safe_float(row.get("market_score")) or 0.0,
-                    "private_decision_score": safe_float(row.get("private_decision_score")) or 0.0,
-                    "tradability_score": safe_float(row.get("tradability_score")) or 0.0,
-                    "data_quality_score": safe_float(row.get("data_quality_score")) or 0.0,
-                }
+            rows = [dict(row) for row in reader]
     except OSError as exc:
-        print(f"Failed to read market candidates {path}: {exc}", file=sys.stderr)
-        return {}
-    return out
+        print(f"Failed reading cached trades for {condition_id}: {exc}", file=sys.stderr)
+        return []
+
+    rows.sort(key=lambda r: safe_float(r.get("timestamp")) or -1.0)
+    return rows
+
+
+def write_market_trade_cache(data_dir: Path, cache_dir: str, condition_id: str, rows: Sequence[Dict[str, Any]]) -> None:
+    path = market_trade_cache_path(data_dir, cache_dir, condition_id)
+    write_csv(path, rows)
+
+
+def fetch_market_trades_incremental(
+    client: PolymarketClient,
+    condition_id: str,
+    *,
+    page_limit: int,
+    max_offset: int,
+    seen_uids: Set[str],
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    offset = 0
+
+    while offset <= max_offset:
+        batch = client.get_json(
+            DATA_BASE,
+            "/trades",
+            {
+                "market": condition_id,
+                "takerOnly": False,
+                "limit": page_limit,
+                "offset": offset,
+            },
+        )
+        if not isinstance(batch, list):
+            break
+        if not batch:
+            break
+
+        unseen_in_batch = 0
+        for idx, row in enumerate(batch):
+            if not isinstance(row, dict):
+                continue
+            uid = trade_uid(row, idx)
+            if uid in seen_uids:
+                continue
+            rows.append(row)
+            seen_uids.add(uid)
+            unseen_in_batch += 1
+
+        page_number = (offset // page_limit) + 1 if page_limit > 0 else 1
+        print(
+            f"    market trades {condition_id[:10]}... page {page_number} unseen={unseen_in_batch}",
+            file=sys.stderr,
+        )
+
+        if unseen_in_batch == 0:
+            break
+        if len(batch) < page_limit:
+            break
+        offset += page_limit
+
+    rows.sort(key=lambda r: safe_float(r.get("timestamp")) or -1.0)
+    return rows
+
+
+def select_market_ids(markets: Dict[str, MarketInfo], requested: Optional[Sequence[str]]) -> List[str]:
+    market_ids = sorted(markets.keys())
+    if not requested:
+        return market_ids
+
+    by_slug: Dict[str, str] = {}
+    for cid, info in markets.items():
+        slug = info.slug.strip().lower()
+        if slug and slug not in by_slug:
+            by_slug[slug] = cid
+
+    selected: List[str] = []
+    seen: Set[str] = set()
+    for token in requested:
+        key = str(token or "").strip()
+        if not key:
+            continue
+        cid = key if key in markets else by_slug.get(key.lower())
+        if not cid:
+            print(f"Warning: requested market not found in cache: {key}", file=sys.stderr)
+            continue
+        if cid in seen:
+            continue
+        seen.add(cid)
+        selected.append(cid)
+    return selected
 
 
 def build_event_cluster_id(event: JumpEvent, cluster_window_seconds: int) -> str:
@@ -464,25 +560,56 @@ def signed_yes_exposure(trade: Dict[str, Any], market: MarketInfo) -> Optional[f
 
 def market_trade_rows(
     client: PolymarketClient,
+    data_dir: Path,
+    cache_dir: str,
     condition_id: str,
     *,
     page_limit: int,
     max_offset: int,
+    allow_api: bool,
+    force_refresh: bool,
 ) -> List[Dict[str, Any]]:
-    rows = fetch_paginated(
+    cached_rows = load_cached_market_trades(data_dir, cache_dir, condition_id)
+    if not allow_api:
+        return cached_rows
+
+    if force_refresh:
+        fetched = fetch_paginated(
+            client,
+            DATA_BASE,
+            "/trades",
+            {
+                "market": condition_id,
+                "takerOnly": False,
+            },
+            limit=page_limit,
+            max_offset=max_offset,
+            progress_label=f"market trades {condition_id[:10]}...",
+        )
+        fetched.sort(key=lambda r: safe_float(r.get("timestamp")) or -1.0)
+        write_market_trade_cache(data_dir, cache_dir, condition_id, fetched)
+        return fetched
+
+    seen_uids = {trade_uid(row, i) for i, row in enumerate(cached_rows)}
+    new_rows = fetch_market_trades_incremental(
         client,
-        DATA_BASE,
-        "/trades",
-        {
-            "market": condition_id,
-            "takerOnly": False,
-        },
-        limit=page_limit,
+        condition_id,
+        page_limit=page_limit,
         max_offset=max_offset,
-        progress_label=f"market trades {condition_id[:10]}...",
+        seen_uids=seen_uids,
     )
-    rows.sort(key=lambda r: safe_float(r.get("timestamp")) or -1.0)
-    return rows
+
+    if not new_rows:
+        return cached_rows
+
+    combined = list(cached_rows) + new_rows
+    dedup: Dict[str, Dict[str, Any]] = {}
+    for i, row in enumerate(combined):
+        dedup[trade_uid(row, i)] = row
+    out = list(dedup.values())
+    out.sort(key=lambda r: safe_float(r.get("timestamp")) or -1.0)
+    write_market_trade_cache(data_dir, cache_dir, condition_id, out)
+    return out
 
 
 def sum_notional_in_window(trades: Sequence[Dict[str, Any]], start_ts: float, end_ts: float) -> float:
@@ -563,18 +690,6 @@ def main() -> None:
     tau_seconds = float(parse_duration_seconds(args.tau))
     cluster_window_seconds = parse_duration_seconds(args.event_cluster_window)
 
-    candidate_scores = load_market_candidates(Path(args.market_candidates_csv))
-    if candidate_scores:
-        print(
-            f"Loaded discovery scores for {len(candidate_scores)} markets from {args.market_candidates_csv}",
-            file=sys.stderr,
-        )
-    else:
-        print(
-            "No market discovery CSV loaded; proceeding with neutral market scores.",
-            file=sys.stderr,
-        )
-
     markets = load_markets(data_dir)
     if not markets:
         print(f"ERROR: No market metadata found under {data_dir / 'market' / 'markets'}", file=sys.stderr)
@@ -593,14 +708,7 @@ def main() -> None:
     client = PolymarketClient(cfg)
 
     events: List[JumpEvent] = []
-    market_ids = sorted(markets.keys())
-
-    if candidate_scores and args.min_market_score > 0:
-        market_ids = [
-            cid
-            for cid in market_ids
-            if (candidate_scores.get(cid, {}).get("market_score", 0.0) >= args.min_market_score)
-        ]
+    market_ids = select_market_ids(markets, args.market)
 
     if args.max_markets > 0:
         market_ids = market_ids[: args.max_markets]
@@ -621,9 +729,7 @@ def main() -> None:
             min_abs_move=args.min_abs_move,
             jump_sigma_mult=args.jump_sigma_mult,
         )
-        market_score = candidate_scores.get(condition_id, {}).get("market_score", 0.0)
         for evt in candidates:
-            evt.market_score = market_score
             evt.cluster_id = build_event_cluster_id(evt, cluster_window_seconds)
         events.extend(candidates)
 
@@ -656,9 +762,13 @@ def main() -> None:
         if event.condition_id not in trades_cache:
             trades_cache[event.condition_id] = market_trade_rows(
                 client,
+                data_dir,
+                args.market_trades_cache_dir,
                 event.condition_id,
                 page_limit=cfg.trades_page_limit,
                 max_offset=cfg.trades_max_offset,
+                allow_api=not args.no_api,
+                force_refresh=args.refresh_market_trades,
             )
         market_trades = trades_cache[event.condition_id]
 
@@ -698,7 +808,6 @@ def main() -> None:
                 "volume_during_jump": event.volume_during_jump,
                 "volume_before_jump": event.volume_before_jump,
                 "price_window_seconds": event.price_window_seconds,
-                "market_score": event.market_score,
                 "participants": len(per_user),
             }
         )
@@ -708,8 +817,7 @@ def main() -> None:
             directional_weight = min(1.0, directional_ratio / max(args.min_directional_ratio, 1e-6))
 
             base_capture = float(rec["jump_capture"])
-            market_mult = market_score_multiplier(event.market_score, args.market_score_weight)
-            capture = base_capture * market_mult * directional_weight
+            capture = base_capture * directional_weight
 
             captures_by_event[event.event_id].append((wallet, capture))
             user_event_rows.append(
@@ -724,8 +832,6 @@ def main() -> None:
                     "gross_notional": rec["gross_notional"],
                     "directional_ratio": directional_ratio,
                     "directional_weight": directional_weight,
-                    "market_score": event.market_score,
-                    "market_score_multiplier": market_mult,
                     "chosen_lookback_seconds": rec["chosen_lookback_seconds"],
                     "jump_time": int(event.jump_time),
                     "delta_p": event.delta_p,
