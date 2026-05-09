@@ -1,2 +1,0 @@
-conditionId,question,slug,eventSlug,closed,active,closedTime,endDate,winner,winningOutcomeIndex,outcomes,outcomePrices,clobTokenIds,liquidityNum,volumeNum,volume24hr,umaResolutionStatus
-0x035089712a52a87cc30b778965d76c757067e7a2e795e4f2c8e32c76438e1dc3,Anthropic CEO arrested?,anthropic-ceo-arrested,,False,True,,2026-06-30T00:00:00Z,,,"[""Yes"", ""No""]","[""0.014"", ""0.986""]","[""35248949130048187542821817357758395454361983867276211793280555330591974711193"", ""34671193575815328652779442360212808698299772626260618024427086904285673603905""]",7282.77549,160648.10700299987,,

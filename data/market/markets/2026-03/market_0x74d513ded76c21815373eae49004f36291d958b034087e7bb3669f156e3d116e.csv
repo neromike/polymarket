@@ -1,2 +1,0 @@
-conditionId,question,slug,eventSlug,closed,active,closedTime,endDate,winner,winningOutcomeIndex,outcomes,outcomePrices,clobTokenIds,liquidityNum,volumeNum,volume24hr,umaResolutionStatus
-0x74d513ded76c21815373eae49004f36291d958b034087e7bb3669f156e3d116e,US x Iran ceasefire by March 6?,us-x-iran-ceasefire-by-march-6,,True,True,2026-03-07 08:32:57+00,,,,"[""Yes"", ""No""]","[""0"", ""1""]","[""45384651537373960665605066318330086764816901476264060880498387434805925753491"", ""87029456871124409957118597145460769231369243167758279728022143015754701469966""]",,,,resolved
