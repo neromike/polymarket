@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import csv
 import math
 import sys
@@ -9,6 +10,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from cli import write_csv
+from config import AnalyzerConfig
+from download_data import download_for_user
 from utils import safe_float
 
 
@@ -505,6 +508,43 @@ def load_trades_for_user(user_dir: Path) -> List[Dict[str, Any]]:
     return trades
 
 
+def hydrate_missing_users(
+    user_dirs: Sequence[Path],
+    data_dir: Path,
+    *,
+    sleep_between_requests: float,
+) -> Tuple[int, int]:
+    """Fetch user data for folders that do not yet contain trades."""
+    hydrated = 0
+    failed = 0
+    cfg = AnalyzerConfig(sleep_between_requests=sleep_between_requests)
+
+    for user_dir in user_dirs:
+        user_key = user_dir.name
+        if load_trades_for_user(user_dir):
+            continue
+
+        print(f"Hydrating missing trades for {user_key}...", file=sys.stderr)
+        try:
+            download_for_user(
+                user_key,
+                cfg,
+                data_dir,
+                skip_price_history=True,
+                price_fidelity_minutes=60,
+                max_price_window_days=7,
+                force_trades_refresh=False,
+                force_market_refresh=False,
+                force_price_refresh=False,
+            )
+            hydrated += 1
+        except Exception as exc:
+            failed += 1
+            print(f"  Failed hydrating {user_key}: {exc}", file=sys.stderr)
+
+    return hydrated, failed
+
+
 def load_markets(data_dir: Path) -> Dict[str, Dict[str, Any]]:
     """Load all market metadata across all months."""
     markets_root = data_dir / "market" / "markets"
@@ -724,7 +764,13 @@ def analyze_user(
     return output_row
 
 
-def run_all_users_analysis(data_dir: Path | None = None, reports_dir: Path | None = None) -> List[Dict[str, Any]]:
+def run_all_users_analysis(
+    data_dir: Path | None = None,
+    reports_dir: Path | None = None,
+    *,
+    hydrate_missing: bool = True,
+    sleep_between_requests: float = 0.05,
+) -> List[Dict[str, Any]]:
     """Run luck/skill analysis for all users found under data/user and write reports outputs."""
     data_dir = data_dir or Path("data")
     reports_dir = reports_dir or (Path("reports") / "luck_skill")
@@ -741,6 +787,18 @@ def run_all_users_analysis(data_dir: Path | None = None, reports_dir: Path | Non
     if not users_dir.exists():
         print("ERROR: ./data/user directory not found.", file=sys.stderr)
         return []
+
+    user_dirs = sorted([d for d in users_dir.iterdir() if d.is_dir()])
+    if hydrate_missing and user_dirs:
+        hydrated, failed = hydrate_missing_users(
+            user_dirs,
+            data_dir,
+            sleep_between_requests=sleep_between_requests,
+        )
+        print(
+            f"Hydration summary: hydrated={hydrated}, failed={failed}, total_users={len(user_dirs)}",
+            file=sys.stderr,
+        )
 
     print("Loading market data...", file=sys.stderr)
     markets = load_markets(data_dir)
@@ -773,8 +831,38 @@ def run_all_users_analysis(data_dir: Path | None = None, reports_dir: Path | Non
     return all_rows
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run luck/skill analysis for users under data/user, hydrating missing trade data by default."
+    )
+    parser.add_argument("--data-dir", default="data", help="Data directory root (default: data)")
+    parser.add_argument(
+        "--reports-dir",
+        default="reports/luck_skill",
+        help="Output directory for luck/skill reports (default: reports/luck_skill)",
+    )
+    parser.add_argument(
+        "--no-hydrate-missing-users",
+        action="store_true",
+        help="Do not auto-download data for users with empty trade folders.",
+    )
+    parser.add_argument(
+        "--sleep",
+        type=float,
+        default=0.05,
+        help="Seconds to sleep between API calls when hydrating missing users.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
-    run_all_users_analysis()
+    args = parse_args()
+    run_all_users_analysis(
+        data_dir=Path(args.data_dir),
+        reports_dir=Path(args.reports_dir),
+        hydrate_missing=not args.no_hydrate_missing_users,
+        sleep_between_requests=args.sleep,
+    )
 
 
 if __name__ == "__main__":

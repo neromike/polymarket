@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import re
 import sys
 from datetime import datetime, timezone
 from bisect import bisect_left
@@ -15,6 +16,9 @@ from api import PolymarketClient, fetch_paginated
 from cli import write_csv
 from config import DATA_BASE, AnalyzerConfig
 from utils import parse_jsonish_list, safe_float
+
+
+USER_KEY_RE = re.compile(r"[^a-z0-9._-]+")
 
 
 @dataclass
@@ -220,6 +224,42 @@ def slugify_text(value: str) -> str:
     text = "".join(ch.lower() if ch.isalnum() else "_" for ch in str(value or ""))
     text = "_".join(part for part in text.split("_") if part)
     return text or "unknown"
+
+
+def user_dir_key(value: str) -> str:
+    text = str(value or "").strip().lower()
+    text = USER_KEY_RE.sub("_", text)
+    text = text.strip("._")
+    return text or "unknown_user"
+
+
+def seed_user_dirs_for_candidates(
+    data_dir: Path,
+    candidates: Sequence[Dict[str, Any]],
+    accepted_confidences: Set[str],
+) -> Tuple[int, int]:
+    users_root = data_dir / "user"
+    users_root.mkdir(parents=True, exist_ok=True)
+
+    created = 0
+    existing = 0
+    for row in candidates:
+        confidence = str(row.get("confidence_level") or "").strip().lower()
+        if confidence not in accepted_confidences:
+            continue
+
+        wallet = str(row.get("wallet") or "").strip()
+        if not wallet:
+            continue
+
+        folder = users_root / user_dir_key(wallet)
+        if folder.exists():
+            existing += 1
+            continue
+        folder.mkdir(parents=True, exist_ok=True)
+        created += 1
+
+    return created, existing
 
 
 def trade_uid(trade: Dict[str, Any], idx: int = 0) -> str:
@@ -986,10 +1026,23 @@ def main() -> None:
     write_csv(out_dir / "user_event_scores.csv", user_event_rows)
     write_csv(out_dir / "candidate_users.csv", candidates)
 
+    seeded_created, seeded_existing = seed_user_dirs_for_candidates(
+        data_dir,
+        candidates,
+        accepted_confidences={"high", "very_high"},
+    )
+
     print("", file=sys.stderr)
     print(f"Jump events written: {out_dir / 'jump_events.csv'}", file=sys.stderr)
     print(f"User-event scores written: {out_dir / 'user_event_scores.csv'}", file=sys.stderr)
     print(f"Candidate users written: {out_dir / 'candidate_users.csv'}", file=sys.stderr)
+    print(
+        (
+            "Seeded data/user folders for high-confidence candidates: "
+            f"created={seeded_created}, already_present={seeded_existing}"
+        ),
+        file=sys.stderr,
+    )
 
     top_n = min(15, len(candidates))
     if top_n:
