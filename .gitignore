@@ -19,5 +19,3 @@ env/
 # Local environment files
 .env
 .env.*
-
-/reports/market_scanner_dashboard.html
