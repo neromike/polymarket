@@ -31,6 +31,11 @@ def parse_args() -> argparse.Namespace:
         help="Output HTML path",
     )
     parser.add_argument(
+        "--data-dir",
+        default="data",
+        help="Data cache directory used to enrich market links",
+    )
+    parser.add_argument(
         "--max-wallet-events",
         type=int,
         default=120,
@@ -45,16 +50,66 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def read_csv_rows(path: Path) -> List[Dict[str, str]]:
+def read_csv_rows(path: Path, limit: Optional[int] = None) -> List[Dict[str, str]]:
     if not path.exists():
         return []
     try:
         with path.open("r", newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
-            return [dict(row) for row in reader]
+            rows = []
+            for row in reader:
+                rows.append(dict(row))
+                if limit is not None and len(rows) >= limit:
+                    break
+            return rows
     except OSError as exc:
         print(f"Failed reading {path}: {exc}", file=sys.stderr)
         return []
+
+
+def latest_market_cache_file(data_dir: Path, condition_id: str) -> Optional[Path]:
+    normalized = str(condition_id or "").strip().lower()
+    if not normalized:
+        return None
+    markets_root = data_dir / "market" / "markets"
+    if not markets_root.exists():
+        return None
+    files = list(markets_root.glob(f"*/market_{normalized}.csv"))
+    if not files:
+        return None
+    try:
+        return max(files, key=lambda path: path.stat().st_mtime)
+    except OSError:
+        return files[0]
+
+
+def market_cache_summary(data_dir: Path, condition_id: str) -> Dict[str, str]:
+    normalized = str(condition_id or "").strip().lower()
+    if not normalized:
+        return {}
+
+    summary: Dict[str, str] = {}
+    cache_path = latest_market_cache_file(data_dir, normalized)
+    rows = read_csv_rows(cache_path, limit=1) if cache_path else []
+    if rows:
+        row = rows[0]
+        summary.update(
+            {
+                "question": row.get("question") or row.get("title") or "",
+                "slug": row.get("slug") or "",
+                "event_slug": row.get("eventSlug") or row.get("event_slug") or "",
+            }
+        )
+
+    if not summary.get("event_slug") or not summary.get("slug") or not summary.get("question"):
+        trade_rows = read_csv_rows(data_dir / "market" / "trades" / normalized / "trades.csv", limit=1)
+        if trade_rows:
+            row = trade_rows[0]
+            summary["question"] = summary.get("question") or row.get("title") or row.get("market_title") or ""
+            summary["slug"] = summary.get("slug") or row.get("slug") or ""
+            summary["event_slug"] = summary.get("event_slug") or row.get("eventSlug") or row.get("event_slug") or ""
+
+    return summary
 
 
 def _to_unix(ts: Any) -> Optional[float]:
@@ -71,6 +126,7 @@ def build_payload(
     event_rows: List[Dict[str, str]],
     user_event_rows: List[Dict[str, str]],
     *,
+    data_dir: Path,
     max_wallet_events: int,
     max_event_wallets: int,
 ) -> Dict[str, Any]:
@@ -103,12 +159,14 @@ def build_payload(
         if not event_id:
             continue
         jump_ts = _to_unix(row.get("jump_time"))
+        condition_id = str(row.get("condition_id") or "")
+        cached = market_cache_summary(data_dir, condition_id)
         event_obj = {
             "event_id": event_id,
-            "condition_id": str(row.get("condition_id") or ""),
-            "question": str(row.get("question") or ""),
-            "slug": str(row.get("slug") or ""),
-            "event_slug": str(row.get("event_slug") or ""),
+            "condition_id": condition_id,
+            "question": str(row.get("question") or cached.get("question") or ""),
+            "slug": str(row.get("slug") or cached.get("slug") or ""),
+            "event_slug": str(row.get("event_slug") or cached.get("event_slug") or ""),
             "jump_time": int(jump_ts) if jump_ts is not None else None,
             "p_before": safe_float(row.get("p_before")),
             "p_after": safe_float(row.get("p_after")),
@@ -651,8 +709,13 @@ def build_html(payload: Dict[str, Any]) -> str:
     }
 
     function marketHref(slug, eventSlug, conditionId) {
-      if (eventSlug) return "https://polymarket.com/event/" + encodeURIComponent(eventSlug);
-      if (slug) return "https://polymarket.com/market/" + encodeURIComponent(slug);
+      var marketSlug = slug ? String(slug).trim() : "";
+      var parentSlug = eventSlug ? String(eventSlug).trim() : "";
+      if (parentSlug && marketSlug && parentSlug !== marketSlug) {
+        return "https://polymarket.com/event/" + encodeURIComponent(parentSlug) + "/" + encodeURIComponent(marketSlug);
+      }
+      var fallbackSlug = parentSlug || marketSlug;
+      if (fallbackSlug) return "https://polymarket.com/event/" + encodeURIComponent(fallbackSlug);
       if (conditionId) return "https://polymarket.com/market/" + encodeURIComponent(conditionId);
       return "";
     }
@@ -903,6 +966,7 @@ def main() -> None:
         candidate_rows,
         event_rows,
         user_event_rows,
+        data_dir=Path(args.data_dir),
         max_wallet_events=max(1, args.max_wallet_events),
         max_event_wallets=max(1, args.max_event_wallets),
     )

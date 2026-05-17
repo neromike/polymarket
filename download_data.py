@@ -13,6 +13,7 @@ from typing import Any, DefaultDict, Dict, Iterable, List, Sequence, Set, Tuple
 from api import ApiError, MetadataCache, PolymarketClient, fetch_paginated, resolve_user_to_wallet
 from cli import write_csv
 from config import CLOB_BASE, DATA_BASE, AnalyzerConfig
+from runtime_state import update_watermark
 from utils import safe_float
 
 
@@ -242,7 +243,16 @@ def trade_uid(trade: Dict[str, Any]) -> str:
     txhash = str(trade.get("transactionHash") or "").strip()
     if txhash:
         return txhash
-    return ""
+    pieces = [
+        str(trade.get("conditionId") or ""),
+        str(trade.get("asset") or ""),
+        str(trade.get("side") or ""),
+        str(trade.get("timestamp") or ""),
+        str(trade.get("price") or ""),
+        str(trade.get("size") or ""),
+    ]
+    fallback = "|".join(pieces).strip("|")
+    return fallback
 
 
 def load_existing_trade_uids(data_dir: Path, key: str) -> Set[str]:
@@ -264,6 +274,75 @@ def load_existing_trade_uids(data_dir: Path, key: str) -> Set[str]:
             except OSError:
                 continue
     return uids
+
+
+def load_cached_trade_rows(data_dir: Path, key: str) -> List[Dict[str, Any]]:
+    base_dir = data_dir / "user" / key / "trades"
+    if not base_dir.exists():
+        return []
+
+    rows: List[Dict[str, Any]] = []
+    for csv_file in sorted(base_dir.rglob("trade_*.csv")):
+        try:
+            with csv_file.open("r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                rows.extend(dict(row) for row in reader)
+        except OSError:
+            continue
+    return rows
+
+
+def fetch_user_trades_incremental(
+    client: PolymarketClient,
+    wallet: str,
+    cfg: AnalyzerConfig,
+    *,
+    seen_uids: Set[str],
+) -> List[Dict[str, Any]]:
+    """Fetch newest trade pages until a page contains no unseen trades."""
+    rows: List[Dict[str, Any]] = []
+    offset = 0
+
+    while offset <= cfg.trades_max_offset:
+        batch = client.get_json(
+            DATA_BASE,
+            "/trades",
+            {
+                "user": wallet,
+                "takerOnly": False,
+                "limit": cfg.trades_page_limit,
+                "offset": offset,
+            },
+        )
+        if not isinstance(batch, list):
+            raise ApiError(f"Expected list from /trades, got {type(batch).__name__}")
+        if not batch:
+            break
+
+        unseen_in_batch = 0
+        for row in batch:
+            if not isinstance(row, dict):
+                continue
+            uid = trade_uid(row)
+            if uid and uid in seen_uids:
+                continue
+            rows.append(row)
+            if uid:
+                seen_uids.add(uid)
+            unseen_in_batch += 1
+
+        page_number = (offset // cfg.trades_page_limit) + 1 if cfg.trades_page_limit > 0 else 1
+        print(
+            f"    trades for {wallet}: page {page_number} unseen={unseen_in_batch}",
+            file=sys.stderr,
+        )
+
+        if unseen_in_batch == 0 or len(batch) < cfg.trades_page_limit:
+            break
+        offset += cfg.trades_page_limit
+
+    rows.sort(key=lambda r: to_unix_seconds(r.get("timestamp")) or -1.0)
+    return rows
 
 
 def month_bounds_utc(month_key: str) -> Tuple[int, int]:
@@ -341,11 +420,17 @@ def fetch_price_history_adaptive(
 
 
 def flatten_market_row(market: Dict[str, Any]) -> Dict[str, Any]:
+    event_slug = market.get("eventSlug")
+    if not event_slug:
+        for event in market.get("events") or []:
+            if isinstance(event, dict) and event.get("slug"):
+                event_slug = event.get("slug")
+                break
     return {
         "conditionId": market.get("conditionId"),
         "question": market.get("question"),
         "slug": market.get("slug"),
-        "eventSlug": market.get("eventSlug"),
+        "eventSlug": event_slug,
         "closed": market.get("closed"),
         "active": market.get("active"),
         "closedTime": market.get("closedTime"),
@@ -390,29 +475,52 @@ def download_for_user(
 
     print(f"Resolved {user} to wallet {wallet}", file=sys.stderr)
 
-    trades = fetch_paginated(
-        client,
-        DATA_BASE,
-        "/trades",
-        {
-            "user": wallet,
-            "takerOnly": False,
-        },
-        limit=cfg.trades_page_limit,
-        max_offset=cfg.trades_max_offset,
-        progress_label=f"trades for {wallet}",
-    )
-    print(f"Fetched {len(trades)} trades from API", file=sys.stderr)
-
     existing_trade_uids = load_existing_trade_uids(data_dir, key)
     if existing_trade_uids:
         print(f"Found {len(existing_trade_uids)} existing cached trade UIDs", file=sys.stderr)
 
-    new_trades = [t for t in trades if trade_uid(t) not in existing_trade_uids]
+    if force_trades_refresh or not existing_trade_uids:
+        trades = fetch_paginated(
+            client,
+            DATA_BASE,
+            "/trades",
+            {
+                "user": wallet,
+                "takerOnly": False,
+            },
+            limit=cfg.trades_page_limit,
+            max_offset=cfg.trades_max_offset,
+            progress_label=f"trades for {wallet}",
+        )
+        print(f"Fetched {len(trades)} trades from API", file=sys.stderr)
+    else:
+        trades = fetch_user_trades_incremental(
+            client,
+            wallet,
+            cfg,
+            seen_uids=set(existing_trade_uids),
+        )
+        print(f"Fetched {len(trades)} new/changed trades from API", file=sys.stderr)
+
+    new_trades = [t for t in trades if force_trades_refresh or trade_uid(t) not in existing_trade_uids]
     if new_trades:
         print(f"Identified {len(new_trades)} new trades to write", file=sys.stderr)
     else:
         print("No new trades found; all trades already cached", file=sys.stderr)
+
+    trades_to_process = list(trades)
+    if existing_trade_uids and (force_market_refresh or force_price_refresh) and not force_trades_refresh:
+        cached_trades = load_cached_trade_rows(data_dir, key)
+        cached_uids = {trade_uid(t) for t in cached_trades if trade_uid(t)}
+        appended_new = [t for t in trades if trade_uid(t) not in cached_uids]
+        trades_to_process = cached_trades + appended_new
+        print(
+            (
+                f"Loaded {len(cached_trades)} cached trades for forced metadata/price refresh; "
+                f"processing {len(trades_to_process)} trade rows"
+            ),
+            file=sys.stderr,
+        )
 
     user_trade_rows_by_month: DefaultDict[str, List[Dict[str, Any]]] = defaultdict(list)
     condition_months: DefaultDict[str, set[str]] = defaultdict(set)
@@ -420,7 +528,7 @@ def download_for_user(
     asset_trade_months: DefaultDict[str, Set[str]] = defaultdict(set)
     new_trade_uids_set = {trade_uid(t) for t in new_trades if trade_uid(t)}
 
-    for trade_index, (month, trade) in enumerate(iter_trade_months(trades), start=1):
+    for trade_index, (month, trade) in enumerate(iter_trade_months(trades_to_process), start=1):
         is_new = trade_uid(trade) in new_trade_uids_set
         if is_new:
             trade_row = dict(trade)
@@ -522,12 +630,38 @@ def download_for_user(
     if market_files_written:
         print(f"Wrote {market_files_written} market files", file=sys.stderr)
 
+    latest_trade_ts = max(
+        (ts for ts in (to_unix_seconds(t.get("timestamp")) for t in trades_to_process) if ts is not None),
+        default=None,
+    )
+    user_update_state: Dict[str, Any] = {
+        "wallet": wallet,
+        "profile_name": profile.get("name") or "",
+        "profile_pseudonym": profile.get("pseudonym") or "",
+        "trades_seen_in_last_update": len(trades),
+        "trades_processed_for_related_data": len(trades_to_process),
+        "new_trades_written": len(new_trades),
+        "trade_files_written": trade_files_written,
+        "market_files_written": market_files_written,
+        "price_history_skipped": bool(skip_price_history),
+        "force_trades_refresh": bool(force_trades_refresh),
+        "force_market_refresh": bool(force_market_refresh),
+        "force_price_refresh": bool(force_price_refresh),
+    }
+    if latest_trade_ts is not None:
+        user_update_state["last_seen_trade_ts"] = int(latest_trade_ts)
+        user_update_state["last_seen_trade_utc"] = datetime.fromtimestamp(
+            latest_trade_ts,
+            tz=timezone.utc,
+        ).isoformat()
+    update_watermark(data_dir, "users", key, user_update_state)
+
     if skip_price_history:
         print("Skipped price history download (--skip-price-history).", file=sys.stderr)
         return
 
     asset_to_condition: Dict[str, str] = {}
-    for trade in trades:
+    for trade in trades_to_process:
         asset = str(trade.get("asset") or "")
         condition_id = str(trade.get("conditionId") or "")
         if asset and condition_id and asset not in asset_to_condition:
@@ -639,6 +773,17 @@ def download_for_user(
     print(
         f"Wrote {price_files_written} price-history files; skipped {skipped_assets} cached assets",
         file=sys.stderr,
+    )
+    update_watermark(
+        data_dir,
+        "users",
+        key,
+        {
+            "price_history_skipped": False,
+            "price_files_written": price_files_written,
+            "price_assets_fetched": fetched_assets,
+            "price_assets_skipped_cached": skipped_assets,
+        },
     )
 
 

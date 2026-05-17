@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import sys
@@ -11,6 +12,18 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from utils import parse_jsonish_list, safe_float, safe_int
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Build the user luck/skill HTML dashboard.")
+    parser.add_argument("--data-dir", default="data", help="Data directory root (default: data)")
+    parser.add_argument(
+        "--report-users-dir",
+        default="reports/luck_skill/users",
+        help="Directory containing per-user metrics (default: reports/luck_skill/users)",
+    )
+    parser.add_argument("--out", default="reports/dashboard.html", help="Output HTML path")
+    return parser.parse_args()
 
 
 def _is_truthy(value: Any) -> bool:
@@ -685,11 +698,12 @@ def build_dashboard_html(payload: Dict[str, Any]) -> str:
         var eventSlug = (row && row.event_slug) ? String(row.event_slug) : "";
         var marketSlug = (row && row.market_slug) ? String(row.market_slug) : "";
         var conditionId = (row && row.condition_id) ? String(row.condition_id) : "";
-        if (eventSlug) {
-          return "https://polymarket.com/event/" + encodeURIComponent(eventSlug);
+        if (eventSlug && marketSlug && eventSlug !== marketSlug) {
+          return "https://polymarket.com/event/" + encodeURIComponent(eventSlug) + "/" + encodeURIComponent(marketSlug);
         }
-        if (marketSlug) {
-          return "https://polymarket.com/market/" + encodeURIComponent(marketSlug);
+        var fallbackSlug = eventSlug || marketSlug;
+        if (fallbackSlug) {
+          return "https://polymarket.com/event/" + encodeURIComponent(fallbackSlug);
         }
         if (conditionId) {
           return "https://polymarket.com/market/" + encodeURIComponent(conditionId);
@@ -999,14 +1013,13 @@ def build_dashboard_html(payload: Dict[str, Any]) -> str:
 
 
 def main() -> None:
-    data_dir = Path("data")
-    report_users_dir = Path("reports") / "luck_skill" / "users"
-    reports_dir = Path("reports")
-    reports_dir.mkdir(parents=True, exist_ok=True)
+    args = parse_args()
+    data_dir = Path(args.data_dir)
+    report_users_dir = Path(args.report_users_dir)
 
     metrics_by_user = load_all_user_metrics(report_users_dir)
     if not metrics_by_user:
-        print("No user metrics found in reports/luck_skill/users. Run test_luck_skill_analysis.py first.", file=sys.stderr)
+        print(f"No user metrics found in {report_users_dir}. Run luck_skill_analysis.py first.", file=sys.stderr)
         return
 
     markets_by_condition = load_markets(data_dir)
@@ -1023,7 +1036,8 @@ def main() -> None:
     payload = build_dashboard_payload(users)
     html = build_dashboard_html(payload)
 
-    output_file = reports_dir / "dashboard.html"
+    output_file = Path(args.out)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
     with open(output_file, "w", encoding="utf-8") as f:
         f.write(html)
 
@@ -1041,4 +1055,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

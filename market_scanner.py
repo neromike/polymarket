@@ -15,6 +15,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from api import PolymarketClient, fetch_paginated
 from cli import write_csv
 from config import DATA_BASE, AnalyzerConfig
+from download_data import sanitize_file_component
+from runtime_state import update_watermark
 from utils import parse_jsonish_list, safe_float
 
 
@@ -117,6 +119,10 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--markets-file",
+        help="Text file containing market targets, one conditionId or slug per line.",
+    )
+    parser.add_argument(
         "--market-trades-cache-dir",
         default="market/trades",
         help=(
@@ -130,9 +136,19 @@ def parse_args() -> argparse.Namespace:
         help="Force full market-trade refresh from API for scanned markets.",
     )
     parser.add_argument(
+        "--allow-api",
+        action="store_true",
+        help="Allow market-trade API calls during scanning. Default is cached data only.",
+    )
+    parser.add_argument(
         "--no-api",
         action="store_true",
-        help="Do not call APIs. Use only cached market trades in data/market/trades.",
+        help="Use only cached market trades. This is the default and kept for compatibility.",
+    )
+    parser.add_argument(
+        "--cache-trades-only",
+        action="store_true",
+        help="Refresh market-trade caches and exit without running jump analysis.",
     )
     parser.add_argument(
         "--event-cluster-window",
@@ -185,6 +201,21 @@ def parse_args() -> argparse.Namespace:
         help="Max historical offset for /trades endpoint",
     )
     return parser.parse_args()
+
+
+def load_market_targets_file(path: Optional[str]) -> List[str]:
+    if not path:
+        return []
+    target_path = Path(path)
+    if not target_path.exists():
+        raise SystemExit(f"Markets file not found: {target_path}")
+    targets: List[str] = []
+    for line in target_path.read_text(encoding="utf-8-sig").splitlines():
+        token = line.strip()
+        if not token or token.startswith("#"):
+            continue
+        targets.append(token)
+    return targets
 
 
 def parse_duration_seconds(text: str) -> int:
@@ -442,18 +473,39 @@ def load_markets(data_dir: Path) -> Dict[str, MarketInfo]:
     return result
 
 
-def load_price_history_by_asset(data_dir: Path) -> Dict[str, List[Tuple[float, float]]]:
+def load_price_history_by_asset(
+    data_dir: Path,
+    assets: Optional[Set[str]] = None,
+) -> Dict[str, List[Tuple[float, float]]]:
     prices_root = data_dir / "market" / "prices-history"
     if not prices_root.exists():
         return {}
 
     by_asset: Dict[str, Dict[int, float]] = defaultdict(dict)
-    for csv_file in sorted(prices_root.rglob("price_history_asset_*.csv")):
+    csv_files: List[Path] = []
+    if assets and len(assets) <= 500:
+        file_names = {
+            f"price_history_asset_{sanitize_file_component(asset, 'asset')}.csv"
+            for asset in assets
+            if str(asset).strip()
+        }
+        for month_dir in sorted(p for p in prices_root.iterdir() if p.is_dir()):
+            for file_name in file_names:
+                csv_file = month_dir / file_name
+                if csv_file.exists():
+                    csv_files.append(csv_file)
+    else:
+        csv_files = sorted(prices_root.rglob("price_history_asset_*.csv"))
+
+    asset_filter = set(assets or [])
+    for csv_file in csv_files:
         try:
             with csv_file.open("r", newline="", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
                     asset = str(row.get("asset") or "")
+                    if asset_filter and asset not in asset_filter:
+                        continue
                     ts = safe_float(row.get("timestamp"))
                     px = safe_float(row.get("price"))
                     if not asset or ts is None or px is None:
@@ -735,11 +787,6 @@ def main() -> None:
         print(f"ERROR: No market metadata found under {data_dir / 'market' / 'markets'}", file=sys.stderr)
         sys.exit(1)
 
-    by_asset = load_price_history_by_asset(data_dir)
-    if not by_asset:
-        print(f"ERROR: No price history found under {data_dir / 'market' / 'prices-history'}", file=sys.stderr)
-        sys.exit(1)
-
     cfg = AnalyzerConfig(
         sleep_between_requests=args.sleep,
         trades_page_limit=args.trades_page_limit,
@@ -747,11 +794,63 @@ def main() -> None:
     )
     client = PolymarketClient(cfg)
 
-    events: List[JumpEvent] = []
-    market_ids = select_market_ids(markets, args.market)
-
+    requested_markets = [*(args.market or []), *load_market_targets_file(args.markets_file)]
+    market_ids = select_market_ids(markets, requested_markets)
     if args.max_markets > 0:
         market_ids = market_ids[: args.max_markets]
+
+    if args.cache_trades_only:
+        print(f"Refreshing trade caches for {len(market_ids)} markets...", file=sys.stderr)
+        refreshed = 0
+        rows_cached = 0
+        for idx, condition_id in enumerate(market_ids, start=1):
+            rows = market_trade_rows(
+                client,
+                data_dir,
+                args.market_trades_cache_dir,
+                condition_id,
+                page_limit=cfg.trades_page_limit,
+                max_offset=cfg.trades_max_offset,
+                allow_api=not args.no_api or args.allow_api,
+                force_refresh=args.refresh_market_trades,
+            )
+            refreshed += 1
+            rows_cached += len(rows)
+            if idx % 25 == 0 or idx == len(market_ids):
+                print(
+                    f"  market-trade cache progress {idx}/{len(market_ids)} | rows_cached={rows_cached}",
+                    file=sys.stderr,
+                )
+
+        update_watermark(
+            data_dir,
+            "updates",
+            "market_trades",
+            {
+                "markets_processed": refreshed,
+                "rows_cached": rows_cached,
+                "cache_dir": args.market_trades_cache_dir,
+                "force_refresh": bool(args.refresh_market_trades),
+            },
+        )
+        print("Market-trade cache refresh complete.", file=sys.stderr)
+        return
+
+    selected_yes_assets = {markets[cid].yes_asset for cid in market_ids if cid in markets}
+    by_asset = load_price_history_by_asset(data_dir, selected_yes_assets)
+    if not by_asset:
+        print(f"ERROR: No price history found under {data_dir / 'market' / 'prices-history'}", file=sys.stderr)
+        sys.exit(1)
+
+    events: List[JumpEvent] = []
+    allow_api = args.allow_api and not args.no_api
+    if allow_api:
+        print("Scanner API access enabled for missing market-trade caches.", file=sys.stderr)
+    else:
+        print(
+            "Scanner using cached market trades only. Use update market-trades or pass --allow-api to refresh.",
+            file=sys.stderr,
+        )
 
     print(f"Scanning {len(market_ids)} markets for jump events...", file=sys.stderr)
     scanned = 0
@@ -781,6 +880,18 @@ def main() -> None:
         out_dir.mkdir(parents=True, exist_ok=True)
         write_csv(out_dir / "jump_events.csv", [])
         write_csv(out_dir / "candidate_users.csv", [])
+        update_watermark(
+            data_dir,
+            "analysis",
+            "market_scanner",
+            {
+                "out_dir": str(out_dir),
+                "markets_scanned": scanned,
+                "jump_events": 0,
+                "candidate_users": 0,
+                "allow_api": bool(allow_api),
+            },
+        )
         return
 
     events.sort(key=lambda e: e.jump_time)
@@ -807,7 +918,7 @@ def main() -> None:
                 event.condition_id,
                 page_limit=cfg.trades_page_limit,
                 max_offset=cfg.trades_max_offset,
-                allow_api=not args.no_api,
+                allow_api=allow_api,
                 force_refresh=args.refresh_market_trades,
             )
         market_trades = trades_cache[event.condition_id]
@@ -887,6 +998,19 @@ def main() -> None:
         write_csv(out_dir / "jump_events.csv", event_rows)
         write_csv(out_dir / "candidate_users.csv", [])
         write_csv(out_dir / "user_event_scores.csv", [])
+        update_watermark(
+            data_dir,
+            "analysis",
+            "market_scanner",
+            {
+                "out_dir": str(out_dir),
+                "markets_scanned": scanned,
+                "jump_events": len(event_rows),
+                "candidate_users": 0,
+                "user_event_scores": 0,
+                "allow_api": bool(allow_api),
+            },
+        )
         return
 
     # Standardize per event to reduce size bias and event heterogeneity.
@@ -1030,6 +1154,21 @@ def main() -> None:
         data_dir,
         candidates,
         accepted_confidences={"high", "very_high"},
+    )
+    update_watermark(
+        data_dir,
+        "analysis",
+        "market_scanner",
+        {
+            "out_dir": str(out_dir),
+            "markets_scanned": scanned,
+            "jump_events": len(event_rows),
+            "candidate_users": len(candidates),
+            "user_event_scores": len(user_event_rows),
+            "seeded_user_dirs_created": seeded_created,
+            "seeded_user_dirs_existing": seeded_existing,
+            "allow_api": bool(allow_api),
+        },
     )
 
     print("", file=sys.stderr)

@@ -9,10 +9,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-from api import ApiError, PolymarketClient
+from api import ApiError, MetadataCache, PolymarketClient
 from cli import write_csv
 from config import GAMMA_BASE, AnalyzerConfig
 from download_data import fetch_price_history_adaptive, flatten_market_row, sanitize_file_component
+from runtime_state import update_watermark
 from utils import parse_jsonish_list, safe_float
 
 
@@ -96,6 +97,15 @@ def parse_args() -> argparse.Namespace:
         help="Maximum selected markets to cache (default: 250)",
     )
     parser.add_argument(
+        "--market",
+        action="append",
+        help="Specific conditionId to cache/update. Repeat to refresh more than one market.",
+    )
+    parser.add_argument(
+        "--markets-file",
+        help="Text file containing conditionIds to cache/update, one per line.",
+    )
+    parser.add_argument(
         "--closed",
         action="store_true",
         help="Discover closed markets (useful for retrospective runs)",
@@ -129,6 +139,22 @@ def parse_args() -> argparse.Namespace:
         help="Refetch and rewrite price-history files even when monthly cache files exist.",
     )
     return parser.parse_args()
+
+
+def load_market_ids_file(path: Optional[str]) -> List[str]:
+    if not path:
+        return []
+    market_path = Path(path)
+    if not market_path.exists():
+        raise SystemExit(f"Markets file not found: {market_path}")
+
+    ids: List[str] = []
+    for line in market_path.read_text(encoding="utf-8-sig").splitlines():
+        token = line.strip()
+        if not token or token.startswith("#"):
+            continue
+        ids.append(token)
+    return ids
 
 
 def text_blob(market: Dict[str, Any]) -> str:
@@ -467,15 +493,38 @@ def main() -> None:
     client = PolymarketClient(cfg)
 
     data_dir = Path(args.data_dir)
+    requested_markets = []
+    seen_requested = set()
+    for value in [*(args.market or []), *load_market_ids_file(args.markets_file)]:
+        condition_id = str(value or "").strip().lower()
+        if not condition_id or condition_id in seen_requested:
+            continue
+        seen_requested.add(condition_id)
+        requested_markets.append(condition_id)
+    invalid_markets = [value for value in requested_markets if not CONDITION_RE.match(value)]
+    if invalid_markets:
+        raise SystemExit(f"Invalid conditionId: {invalid_markets[0]}")
 
-    markets = fetch_markets_keyset(
-        client,
-        page_size=args.page_size,
-        limit_pages=args.limit_pages,
-        closed=args.closed,
-        min_volume=args.min_volume,
-        min_liquidity=args.min_liquidity,
-    )
+    if requested_markets:
+        metadata = MetadataCache()
+        markets_by_id = metadata.fetch_markets_for_conditions(client, requested_markets)
+        missing = [condition_id for condition_id in requested_markets if condition_id not in markets_by_id]
+        if missing:
+            print(
+                f"Could not find metadata for {len(missing)} requested market(s): {', '.join(missing[:5])}",
+                file=sys.stderr,
+            )
+        markets = [markets_by_id[condition_id] for condition_id in requested_markets if condition_id in markets_by_id]
+        print(f"Fetched {len(markets)} requested market(s) by conditionId.", file=sys.stderr)
+    else:
+        markets = fetch_markets_keyset(
+            client,
+            page_size=args.page_size,
+            limit_pages=args.limit_pages,
+            closed=args.closed,
+            min_volume=args.min_volume,
+            min_liquidity=args.min_liquidity,
+        )
 
     cached_condition_ids = set()
     if not args.force_market_refresh:
@@ -497,27 +546,43 @@ def main() -> None:
             )
 
     if not markets:
-        print("No markets fetched from Gamma keyset endpoint.", file=sys.stderr)
+        print("No markets fetched from Gamma.", file=sys.stderr)
+        update_watermark(
+            data_dir,
+            "updates",
+            "markets",
+            {
+                "markets_fetched": 0,
+                "markets_written": 0,
+                "price_files_written": 0,
+                "closed": bool(args.closed),
+                "requested_markets": len(requested_markets),
+            },
+        )
         return
 
-    diversity = diversity_scores(markets)
+    if requested_markets:
+        selected = [(market, {}) for market in markets]
+        print(f"Selected {len(selected)} requested markets for caching.", file=sys.stderr)
+    else:
+        diversity = diversity_scores(markets)
 
-    scored: List[Tuple[Dict[str, Any], Dict[str, float]]] = []
-    for market in markets:
-        base = score_market_base(market, args.min_volume, args.min_liquidity)
-        if base["data_quality_score"] <= 0:
-            continue
-        div = diversity.get(str(market.get("conditionId") or ""), 0.0)
-        score = final_market_score(base, div)
-        if score <= 0:
-            continue
+        scored: List[Tuple[Dict[str, Any], Dict[str, float]]] = []
+        for market in markets:
+            base = score_market_base(market, args.min_volume, args.min_liquidity)
+            if base["data_quality_score"] <= 0:
+                continue
+            div = diversity.get(str(market.get("conditionId") or ""), 0.0)
+            score = final_market_score(base, div)
+            if score <= 0:
+                continue
 
-        features = {**base, "diversity_score": div, "market_score": score}
-        scored.append((market, features))
+            features = {**base, "diversity_score": div, "market_score": score}
+            scored.append((market, features))
 
-    scored.sort(key=lambda x: x[1]["market_score"], reverse=True)
-    selected = scored[: max(0, args.max_markets)] if args.max_markets > 0 else scored
-    print(f"Selected {len(selected)} new markets for caching.", file=sys.stderr)
+        scored.sort(key=lambda x: x[1]["market_score"], reverse=True)
+        selected = scored[: max(0, args.max_markets)] if args.max_markets > 0 else scored
+        print(f"Selected {len(selected)} new markets for caching.", file=sys.stderr)
 
     market_written = 0
     market_skipped_cached = 0
@@ -569,6 +634,23 @@ def main() -> None:
             f"price_tokens_skipped_cached={price_tokens_skipped_cached}"
         ),
         file=sys.stderr,
+    )
+    update_watermark(
+        data_dir,
+        "updates",
+        "markets",
+        {
+            "markets_fetched": len(markets),
+            "markets_selected": len(selected),
+            "markets_written": market_written,
+            "markets_skipped_cached": market_skipped_cached,
+            "price_files_written": price_files_written,
+            "price_tokens_skipped_cached": price_tokens_skipped_cached,
+            "closed": bool(args.closed),
+            "force_market_refresh": bool(args.force_market_refresh),
+            "force_price_refresh": bool(args.force_price_refresh),
+            "requested_markets": len(requested_markets),
+        },
     )
 
 

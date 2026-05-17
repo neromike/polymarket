@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 from cli import write_csv
 from config import AnalyzerConfig
 from download_data import download_for_user
+from runtime_state import update_watermark
 from utils import safe_float
 
 
@@ -98,6 +99,17 @@ def analyze_luck_and_skill(
     trade_decompositions: List[TradeDecomposition] = []
     exposure_by_market_outcome: Dict[str, Dict[str, float]] = {}
     variance_by_market: Dict[str, float] = {}
+    outcome_info_by_market: Dict[str, Optional[Dict[str, Dict[str, float]]]] = {}
+
+    def outcome_info_for_market(condition_id: str, market: Dict[str, Any]) -> Optional[Dict[str, Dict[str, float]]]:
+        if condition_id not in outcome_info_by_market:
+            outcome_info_by_market[condition_id] = _extract_market_outcome_data(
+                market,
+                min_probability=min_probability,
+                max_probability=max_probability,
+                probability_calibrator=probability_calibrator,
+            )
+        return outcome_info_by_market[condition_id]
 
     skill_total = 0.0
     luck_total = 0.0
@@ -118,12 +130,7 @@ def analyze_luck_and_skill(
             )
             continue
 
-        outcome_info = _extract_market_outcome_data(
-            market,
-            min_probability=min_probability,
-            max_probability=max_probability,
-            probability_calibrator=probability_calibrator,
-        )
+        outcome_info = outcome_info_for_market(condition_id, market)
         if not outcome_info:
             warnings.append(
                 f"Skipped trade index {idx} (conditionId={condition_id}): market has no valid resolved probabilities"
@@ -199,12 +206,7 @@ def analyze_luck_and_skill(
         if not market:
             continue
 
-        outcome_info = _extract_market_outcome_data(
-            market,
-            min_probability=min_probability,
-            max_probability=max_probability,
-            probability_calibrator=probability_calibrator,
-        )
+        outcome_info = outcome_info_for_market(condition_id, market)
         if not outcome_info:
             continue
 
@@ -508,6 +510,22 @@ def load_trades_for_user(user_dir: Path) -> List[Dict[str, Any]]:
     return trades
 
 
+def read_existing_metrics(path: Path) -> Dict[str, Dict[str, Any]]:
+    if not path.exists():
+        return {}
+    rows: Dict[str, Dict[str, Any]] = {}
+    try:
+        with path.open("r", newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                user_key = str(row.get("user_key") or "")
+                if user_key:
+                    rows[user_key] = dict(row)
+    except OSError as exc:
+        print(f"Failed to read existing metrics {path}: {exc}", file=sys.stderr)
+    return rows
+
+
 def hydrate_missing_users(
     user_dirs: Sequence[Path],
     data_dir: Path,
@@ -704,8 +722,7 @@ def analyze_user(
     user_key: str,
     user_dir: Path,
     report_user_dir: Path,
-    markets: Dict[str, Dict[str, Any]],
-    price_history: Dict[str, List[tuple[int, float]]],
+    markets_parsed: Dict[str, Dict[str, Any]],
 ) -> Dict[str, Any] | None:
     """Analyze a single user and save metrics to CSV under reports/luck_skill/users."""
     print(f"Analyzing {user_key}...", file=sys.stderr)
@@ -717,8 +734,6 @@ def analyze_user(
 
     trades = [parse_trade_row(t) for t in trades_raw]
     print(f"  Loaded {len(trades)} trades", file=sys.stderr)
-
-    markets_parsed = {cid: parse_market_row(m, price_history) for cid, m in markets.items()}
 
     try:
         result = analyze_luck_and_skill(trades, markets_parsed, minimum_effective_markets=0)
@@ -768,10 +783,12 @@ def run_all_users_analysis(
     data_dir: Path | None = None,
     reports_dir: Path | None = None,
     *,
-    hydrate_missing: bool = True,
+    users: Sequence[str] | None = None,
+    hydrate_missing: bool = False,
     sleep_between_requests: float = 0.05,
+    use_price_history: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Run luck/skill analysis for all users found under data/user and write reports outputs."""
+    """Run luck/skill analysis for cached users and write reports outputs."""
     data_dir = data_dir or Path("data")
     reports_dir = reports_dir or (Path("reports") / "luck_skill")
     report_users_dir = reports_dir / "users"
@@ -788,7 +805,14 @@ def run_all_users_analysis(
         print("ERROR: ./data/user directory not found.", file=sys.stderr)
         return []
 
+    requested_users = {str(user or "").strip() for user in (users or []) if str(user or "").strip()}
     user_dirs = sorted([d for d in users_dir.iterdir() if d.is_dir()])
+    if requested_users:
+        user_dirs = [d for d in user_dirs if d.name in requested_users]
+        missing_users = sorted(requested_users - {d.name for d in user_dirs})
+        for user_key in missing_users:
+            print(f"WARNING: requested user has no cache directory: {user_key}", file=sys.stderr)
+
     if hydrate_missing and user_dirs:
         hydrated, failed = hydrate_missing_users(
             user_dirs,
@@ -799,16 +823,33 @@ def run_all_users_analysis(
             f"Hydration summary: hydrated={hydrated}, failed={failed}, total_users={len(user_dirs)}",
             file=sys.stderr,
         )
+    elif user_dirs:
+        print(
+            "Hydration skipped; luck/skill analysis is offline by default. "
+            "Pass --hydrate-missing-users to download missing trades first.",
+            file=sys.stderr,
+        )
 
     print("Loading market data...", file=sys.stderr)
     markets = load_markets(data_dir)
     print(f"Loaded {len(markets)} markets", file=sys.stderr)
 
-    print("Loading price history...", file=sys.stderr)
-    price_history = load_price_history(data_dir)
-    print(f"Loaded price history for {len(price_history)} assets", file=sys.stderr)
+    price_history: Dict[str, List[tuple[int, float]]] = {}
+    if use_price_history:
+        print("Loading price history...", file=sys.stderr)
+        price_history = load_price_history(data_dir)
+        print(f"Loaded price history for {len(price_history)} assets", file=sys.stderr)
+    else:
+        print(
+            "Skipping price history for fast offline analysis. "
+            "Pass --use-price-history for the slower settlement-price fallback.",
+            file=sys.stderr,
+        )
 
-    user_dirs = sorted([d for d in users_dir.iterdir() if d.is_dir()])
+    print("Parsing market metadata...", file=sys.stderr)
+    markets_parsed = {cid: parse_market_row(m, price_history) for cid, m in markets.items()}
+    print(f"Parsed {len(markets_parsed)} markets", file=sys.stderr)
+
     print(f"Found {len(user_dirs)} user(s) to analyze", file=sys.stderr)
 
     all_rows: List[Dict[str, Any]] = []
@@ -816,16 +857,50 @@ def run_all_users_analysis(
         user_key = user_dir.name
         try:
             report_user_dir = report_users_dir / user_key
-            row = analyze_user(user_key, user_dir, report_user_dir, markets, price_history)
+            row = analyze_user(user_key, user_dir, report_user_dir, markets_parsed)
             if row is not None:
                 all_rows.append(row)
+                update_watermark(
+                    data_dir,
+                    "analysis_users",
+                    user_key,
+                    {
+                        "reports_dir": str(reports_dir),
+                        "total_trades": row.get("total_trades"),
+                        "resolved_markets": row.get("number_of_resolved_markets"),
+                        "skill_index": row.get("skill_index"),
+                    },
+                )
         except Exception as exc:
             print(f"ERROR analyzing {user_key}: {exc}", file=sys.stderr)
 
     if all_rows:
         all_metrics_path = reports_dir / "metrics_all_users.csv"
-        write_csv(all_metrics_path, all_rows)
+        if requested_users:
+            merged_rows = read_existing_metrics(all_metrics_path)
+            for row in all_rows:
+                user_key = str(row.get("user_key") or "")
+                if user_key:
+                    merged_rows[user_key] = row
+            output_rows = [merged_rows[key] for key in sorted(merged_rows)]
+        else:
+            output_rows = all_rows
+        write_csv(all_metrics_path, output_rows)
         print(f"Saved aggregate metrics to {all_metrics_path}", file=sys.stderr)
+
+    update_watermark(
+        data_dir,
+        "analysis",
+        "luck_skill",
+        {
+            "reports_dir": str(reports_dir),
+            "users_found": len(user_dirs),
+            "users_analyzed": len(all_rows),
+            "requested_users": sorted(requested_users),
+            "hydrate_missing": bool(hydrate_missing),
+            "use_price_history": bool(use_price_history),
+        },
+    )
 
     print("Done.", file=sys.stderr)
     return all_rows
@@ -833,7 +908,7 @@ def run_all_users_analysis(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run luck/skill analysis for users under data/user, hydrating missing trade data by default."
+        description="Run luck/skill analysis for cached users under data/user."
     )
     parser.add_argument("--data-dir", default="data", help="Data directory root (default: data)")
     parser.add_argument(
@@ -842,15 +917,33 @@ def parse_args() -> argparse.Namespace:
         help="Output directory for luck/skill reports (default: reports/luck_skill)",
     )
     parser.add_argument(
+        "--user",
+        action="append",
+        help="Analyze only this cached user key. Repeat to analyze more than one user.",
+    )
+    parser.add_argument(
+        "--hydrate-missing-users",
+        action="store_true",
+        help="Download missing user trade data before analyzing. Analysis is offline by default.",
+    )
+    parser.add_argument(
         "--no-hydrate-missing-users",
         action="store_true",
-        help="Do not auto-download data for users with empty trade folders.",
+        help="Deprecated compatibility flag; hydration is already disabled by default.",
     )
     parser.add_argument(
         "--sleep",
         type=float,
         default=0.05,
         help="Seconds to sleep between API calls when hydrating missing users.",
+    )
+    parser.add_argument(
+        "--use-price-history",
+        action="store_true",
+        help=(
+            "Load cached price-history files as a fallback for settlement prices. "
+            "This can be slow on large caches and is disabled by default."
+        ),
     )
     return parser.parse_args()
 
@@ -860,8 +953,10 @@ def main() -> None:
     run_all_users_analysis(
         data_dir=Path(args.data_dir),
         reports_dir=Path(args.reports_dir),
-        hydrate_missing=not args.no_hydrate_missing_users,
+        users=args.user,
+        hydrate_missing=args.hydrate_missing_users and not args.no_hydrate_missing_users,
         sleep_between_requests=args.sleep,
+        use_price_history=args.use_price_history,
     )
 
 
