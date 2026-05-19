@@ -36,6 +36,7 @@ from sqlite_store import (
     load_market_statuses as sqlite_load_market_statuses,
     load_market_raw_row as sqlite_load_market_raw_row,
     load_market_summary_rows as sqlite_load_market_summary_rows,
+    market_condition_ids as sqlite_market_condition_ids,
     load_scanner_candidate_rows as sqlite_load_scanner_candidate_rows,
     load_scanner_jump_event_rows as sqlite_load_scanner_jump_event_rows,
     load_user_metric_rows as sqlite_load_user_metric_rows,
@@ -1137,16 +1138,37 @@ def load_markets(data_dir: str, reports_dir: str, query: str = "", limit: int = 
     }
 
 
-def listed_market_ids(data_dir: str, reports_dir: str, limit: int = 1000) -> List[str]:
-    payload = load_markets(data_dir, reports_dir, limit=limit)
+def listed_market_ids(data_dir: str, reports_dir: str, limit: int | None = None) -> List[str]:
     ids: List[str] = []
     seen = set()
-    for row in payload.get("rows", []):
-        condition_id = normalize_condition_id(row.get("condition_id"))
+
+    def add(value: Any) -> None:
+        condition_id = normalize_condition_id(value)
         if not condition_id or condition_id in seen:
-            continue
+            return
         seen.add(condition_id)
         ids.append(condition_id)
+
+    market_list = load_market_list(ROOT)
+    for entry in market_list.get("markets", []):
+        add(entry.get("condition_id") if isinstance(entry, dict) else entry)
+
+    if sqlite_database_available(data_dir):
+        db_path = default_db_path(data_dir)
+        try:
+            for event in sqlite_load_scanner_jump_event_rows(db_path):
+                add(event.get("condition_id"))
+        except Exception:
+            pass
+        for condition_id in sorted(sqlite_market_condition_ids(data_dir, db_path=db_path)):
+            add(condition_id)
+    else:
+        payload = load_markets(data_dir, reports_dir, limit=limit or 1000)
+        for row in payload.get("rows", []):
+            add(row.get("condition_id"))
+
+    if limit is not None and limit > 0:
+        return ids[:limit]
     return ids
 
 
@@ -2228,6 +2250,42 @@ INDEX_HTML = """<!doctype html>
         button.title = dark ? "Switch to light mode" : "Switch to dark mode";
       }
     }
+    const actionHelp = {
+      update_markets: "API calls: discover/store markets from Polymarket and refresh market metadata and price history in local SQLite.",
+      update_listed_markets: "API calls: refresh the markets already listed in this dashboard from Polymarket, then store the results locally.",
+      update_market_trades: "API calls: refresh market-level trade rows from Polymarket for the listed markets. Stores results in local SQLite.",
+      analyze_scanner: "Local only: scan cached SQLite market prices/trades for jump events and candidate users. No Polymarket API calls.",
+      update_users_quick: "API calls: refresh user trades and related market metadata from Polymarket, then rerun local user analysis. Skips price history.",
+      update_users_full: "API calls: refresh user trades, related markets, and price history from Polymarket, then rerun local user analysis.",
+      update_candidate_users: "API calls: update users identified by Analyze Markets as candidates, then rerun local user analysis for them."
+    };
+    const tabHelp = {
+      overview: "Local view: show the cached dashboard overview from SQLite and run-state files.",
+      markets: "Local view: show markets stored in SQLite and controls for market API updates and local analysis.",
+      users: "Local view: show analyzed users from SQLite and controls for user API updates or local-only analysis.",
+      jobs: "Local view: show background runs and logs from local run-state files."
+    };
+    const staticButtonHelp = {
+      "add-market": "Local only: add this conditionId to the dashboard market list. Use Update Markets afterward to fetch Polymarket data.",
+      "update-user-input": "API calls: update the entered user from Polymarket, then rerun local user analysis. Skips price history.",
+      "candidate-filter": "Local only: filter the user table to scanner candidate users. No Polymarket API calls.",
+      "update-selected-user": "API calls: update the selected user from Polymarket, then rerun local user analysis. Skips price history.",
+      "analyze-selected-user": "Local only: rerun scoring for the selected user from cached SQLite data. No Polymarket API calls."
+    };
+    function setButtonHelp(button, text) {
+      if (!button || !text) return;
+      button.title = text;
+      button.setAttribute("aria-description", text);
+    }
+    function applyButtonHints(root = document) {
+      root.querySelectorAll(".tab[data-tab]").forEach(button => {
+        setButtonHelp(button, tabHelp[button.dataset.tab]);
+      });
+      root.querySelectorAll("[data-action]").forEach(button => {
+        setButtonHelp(button, actionHelp[button.getAttribute("data-action")]);
+      });
+      Object.entries(staticButtonHelp).forEach(([id, text]) => setButtonHelp($(id), text));
+    }
     let selectedJob = null;
     let selectedUser = null;
     let currentTab = "overview";
@@ -2470,14 +2528,16 @@ INDEX_HTML = """<!doctype html>
 
       $("jobs").innerHTML = sortedRows(data.jobs || [], "jobs").map(job => {
         const cancellable = ["queued", "running"].includes(job.status);
-        const cancel = cancellable ? ` <button data-cancel-job="${esc(job.id)}">Cancel</button>` : "";
+        const cancelTitle = "Local job control: stop this background process if it is still running. Does not start a Polymarket API call.";
+        const cancel = cancellable ? ` <button data-cancel-job="${esc(job.id)}" title="${esc(cancelTitle)}" aria-description="${esc(cancelTitle)}">Cancel</button>` : "";
         const selected = selectedJob === job.id ? " selected" : "";
         const started = job.started_at || job.created_at || "";
+        const logTitle = "Local only: show this run's saved log file. No Polymarket API calls.";
         return `<tr class="clickable${selected}" data-job-row="${esc(job.id)}">
           <td title="${esc(started)}">${esc(shortDate(started))}</td>
           <td title="${esc(job.label)}">${esc(job.label)}</td>
           <td class="${cls(job.status)}">${esc(job.status)}</td>
-          <td><button data-job="${esc(job.id)}">Log</button>${cancel}</td>
+          <td><button data-job="${esc(job.id)}" title="${esc(logTitle)}" aria-description="${esc(logTitle)}">Log</button>${cancel}</td>
         </tr>`;
       }).join("") || emptyRow(4, "No runs recorded");
 
@@ -2508,6 +2568,12 @@ INDEX_HTML = """<!doctype html>
       const candidateButton = $("candidate-filter");
       candidateButton.classList.toggle("active", userCandidateOnly);
       candidateButton.textContent = userCandidateOnly ? "All Users" : "Candidate Users";
+      setButtonHelp(
+        candidateButton,
+        userCandidateOnly
+          ? "Local only: clear the candidate filter and show all users from SQLite. No Polymarket API calls."
+          : "Local only: filter the user table to scanner candidate users. No Polymarket API calls."
+      );
       $("users-count").textContent = intNum(data.count || 0) + (userCandidateOnly ? " candidate users" : " users");
       $("user-total-count").textContent = intNum(data.total_count || 0);
       $("user-shown-count").textContent = intNum(data.count || 0);
@@ -2533,6 +2599,8 @@ INDEX_HTML = """<!doctype html>
         const scannerText = row.candidate_confidence ? `Scanner: ${row.candidate_confidence} | z ${num(row.candidate_timing_z, 2)} | ${intNum(row.candidate_events)} events` : "";
         const evidenceTitle = [row.evidence_summary, scannerText, row.source_label].filter(Boolean).join(" | ");
         const edgePerTradeTitle = row.monetized_edge_per_trade_usdc == null ? "Run user analysis to calculate info edge per trade" : `Conservative per-trade monetization: lower of realized PnL/trade and expected edge/trade. ${evidenceTitle}`;
+        const updateTitle = "API calls: fetch latest Polymarket trades and related market metadata for this user, then rerun local user analysis. Skips price history.";
+        const analyzeTitle = "Local only: rerun this user's scoring from cached SQLite data. No Polymarket API calls.";
         return `<tr class="clickable${selected}" data-user-key="${esc(row.user_key)}">
           <td title="${esc([row.display_name, row.user_key, row.profile_name, row.profile_pseudonym, row.input_user].filter(Boolean).join(' | '))}">${userCell(row, true)}</td>
           <td class="num">${scoreCell(row.info_edge_score, evidenceTitle)}</td>
@@ -2544,7 +2612,7 @@ INDEX_HTML = """<!doctype html>
           <td class="num">${money(row.raw_pnl_usdc, 0)}</td>
           <td class="num">${intNum(row.total_trades)}</td>
           <td title="${esc(row.last_updated_at)}">${esc(shortDate(row.last_updated_at))}</td>
-          <td><button class="mini" data-update-user="${esc(row.user_key)}">Update</button> <button class="mini" data-analyze-user="${esc(row.user_key)}">Analyze</button></td>
+          <td><button class="mini" data-update-user="${esc(row.user_key)}" title="${esc(updateTitle)}" aria-description="${esc(updateTitle)}">Update</button> <button class="mini" data-analyze-user="${esc(row.user_key)}" title="${esc(analyzeTitle)}" aria-description="${esc(analyzeTitle)}">Analyze</button></td>
         </tr>`;
       }).join("") || emptyRow(11, userCandidateOnly ? "No candidate users matched" : "No users yet");
       document.querySelectorAll("[data-user-key]").forEach(row => {
@@ -2591,11 +2659,14 @@ INDEX_HTML = """<!doctype html>
         const marketKey = group.market_key || group.condition_id || group.title;
         const expanded = expandedMarkets.has(marketKey);
         const buttonLabel = expanded ? "-" : "+";
+        const expandTitle = expanded
+          ? "Local only: collapse cached trade fills for this market. No Polymarket API calls."
+          : "Local only: expand cached trade fills for this market. No Polymarket API calls.";
         const detail = expanded ? renderTradeDetail(group.trades || []) : "";
         const status = group.market_status || "unknown";
         const statusLabel = group.market_status_label || "Unknown";
         return `<tr class="market-row-${esc(status)}">
-          <td><button class="expand" data-market-key="${esc(marketKey)}">${buttonLabel}</button></td>
+          <td><button class="expand" data-market-key="${esc(marketKey)}" title="${esc(expandTitle)}" aria-description="${esc(expandTitle)}">${buttonLabel}</button></td>
           <td title="${esc(group.title)}">${marketLink(group)}</td>
           <td class="num">${tradeSignalCell(group)}</td>
           <td><span class="market-status-pill market-status-${esc(status)}">${esc(statusLabel)}</span></td>
@@ -2672,9 +2743,9 @@ INDEX_HTML = """<!doctype html>
     }
     function marketActionButtons(row) {
       const id = row.condition_id || "";
-      const updateTitle = "Refresh this market's stored metadata and price history";
+      const updateTitle = "API calls: refresh this market's stored metadata and price history from Polymarket. Does not rerun scanner analysis by itself.";
       if (!id) return "";
-      const update = `<button class="mini" data-update-market="${esc(id)}" title="${esc(updateTitle)}">Update</button>`;
+      const update = `<button class="mini" data-update-market="${esc(id)}" title="${esc(updateTitle)}" aria-description="${esc(updateTitle)}">Update</button>`;
       return update;
     }
     function bindMarketUpdateButtons() {
@@ -2902,6 +2973,7 @@ INDEX_HTML = """<!doctype html>
       applyTheme(themeName());
       themeButton.onclick = () => applyTheme(themeName() === "dark" ? "light" : "dark");
     }
+    applyButtonHints();
     document.querySelectorAll("th.sortable").forEach(th => {
       th.onclick = () => {
         const tableName = th.dataset.sortTable;
