@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import math
 import sys
 from collections import defaultdict
@@ -9,10 +8,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from cli import write_csv
 from config import AnalyzerConfig
 from download_data import download_for_user
 from runtime_state import update_watermark
+from sqlite_store import (
+    ensure_database,
+    list_user_keys as sqlite_list_user_keys,
+    load_all_market_rows as sqlite_load_all_market_rows,
+    load_all_user_trades as sqlite_load_all_user_trades,
+    load_price_history_points as sqlite_load_price_history_points,
+    load_user_alias_rows as sqlite_load_user_alias_rows,
+    load_user_profile_rows as sqlite_load_user_profile_rows,
+    upsert_user_metric as sqlite_upsert_user_metric,
+    user_has_trades as sqlite_user_has_trades,
+)
 from utils import safe_float
 
 
@@ -489,57 +498,19 @@ def _standard_normal_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
-def load_trades_for_user(user_dir: Path) -> List[Dict[str, Any]]:
-    """Load all trades for a user across all months."""
-    trades_root = user_dir / "trades"
-    if not trades_root.exists():
-        return []
-
-    trades: List[Dict[str, Any]] = []
-    for month_dir in sorted(trades_root.iterdir()):
-        if not month_dir.is_dir():
-            continue
-        for csv_file in sorted(month_dir.glob("trade_*.csv")):
-            try:
-                with csv_file.open("r", newline="", encoding="utf-8") as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        trades.append(dict(row))
-            except OSError as exc:
-                print(f"Failed to read {csv_file}: {exc}", file=sys.stderr)
-    return trades
-
-
-def read_existing_metrics(path: Path) -> Dict[str, Dict[str, Any]]:
-    if not path.exists():
-        return {}
-    rows: Dict[str, Dict[str, Any]] = {}
-    try:
-        with path.open("r", newline="", encoding="utf-8-sig") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                user_key = str(row.get("user_key") or "")
-                if user_key:
-                    rows[user_key] = dict(row)
-    except OSError as exc:
-        print(f"Failed to read existing metrics {path}: {exc}", file=sys.stderr)
-    return rows
-
-
 def hydrate_missing_users(
-    user_dirs: Sequence[Path],
+    user_keys: Sequence[str],
     data_dir: Path,
     *,
     sleep_between_requests: float,
 ) -> Tuple[int, int]:
-    """Fetch user data for folders that do not yet contain trades."""
+    """Fetch user data when the local database has no trades for that user."""
     hydrated = 0
     failed = 0
     cfg = AnalyzerConfig(sleep_between_requests=sleep_between_requests)
 
-    for user_dir in user_dirs:
-        user_key = user_dir.name
-        if load_trades_for_user(user_dir):
+    for user_key in user_keys:
+        if sqlite_user_has_trades(data_dir, user_key):
             continue
 
         print(f"Hydrating missing trades for {user_key}...", file=sys.stderr)
@@ -564,67 +535,21 @@ def hydrate_missing_users(
 
 
 def load_markets(data_dir: Path) -> Dict[str, Dict[str, Any]]:
-    """Load all market metadata across all months."""
-    markets_root = data_dir / "market" / "markets"
-    if not markets_root.exists():
-        return {}
-
-    markets: Dict[str, Dict[str, Any]] = {}
-    for month_dir in sorted(markets_root.iterdir()):
-        if not month_dir.is_dir():
-            continue
-        for csv_file in sorted(month_dir.glob("market_*.csv")):
-            try:
-                with csv_file.open("r", newline="", encoding="utf-8") as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        condition_id = row.get("conditionId")
-                        if condition_id:
-                            markets[condition_id] = dict(row)
-            except OSError as exc:
-                print(f"Failed to read {csv_file}: {exc}", file=sys.stderr)
-    return markets
+    """Load all market metadata from SQLite."""
+    return sqlite_load_all_market_rows(data_dir)
 
 
 def load_price_history(data_dir: Path) -> Dict[str, List[tuple[int, float]]]:
-    """Load all price history records organized by asset. Returns {asset: [(timestamp, price), ...]}"""
-    prices_root = data_dir / "market" / "prices-history"
-    if not prices_root.exists():
-        return {}
-
-    prices_by_asset: Dict[str, List[tuple[int, float]]] = defaultdict(list)
-    for month_dir in sorted(prices_root.iterdir()):
-        if not month_dir.is_dir():
-            continue
-        for csv_file in sorted(month_dir.glob("price_history_asset_*.csv")):
-            try:
-                with csv_file.open("r", newline="", encoding="utf-8") as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        asset = row.get("asset")
-                        ts = row.get("timestamp")
-                        price_str = row.get("price")
-                        if asset and ts and price_str:
-                            try:
-                                ts_int = int(float(ts))
-                                price = float(price_str)
-                                prices_by_asset[asset].append((ts_int, price))
-                            except (ValueError, TypeError):
-                                continue
-            except OSError as exc:
-                print(f"Failed to read {csv_file}: {exc}", file=sys.stderr)
-
-    for asset in prices_by_asset:
-        prices_by_asset[asset].sort(key=lambda x: x[0])
-
-    return prices_by_asset
+    """Load all price history records organized by asset from SQLite."""
+    points = sqlite_load_price_history_points(data_dir)
+    return {asset: [(int(ts), px) for ts, px in rows] for asset, rows in points.items()}
 
 
 def parse_market_row(
     row: Dict[str, Any],
     price_history: Dict[str, List[tuple[int, float]]],
 ) -> Dict[str, Any]:
-    """Convert CSV market row fields to proper types for luck_skill_analysis."""
+    """Normalize market row fields for luck_skill_analysis."""
     import json
 
     def try_parse_json(value: Any) -> Any:
@@ -691,7 +616,7 @@ def parse_market_row(
 
 
 def parse_trade_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert CSV trade row fields to proper types for luck_skill_analysis."""
+    """Normalize trade row fields for luck_skill_analysis."""
 
     def to_float(value: Any) -> float | None:
         if value is None:
@@ -720,14 +645,13 @@ def parse_trade_row(row: Dict[str, Any]) -> Dict[str, Any]:
 
 def analyze_user(
     user_key: str,
-    user_dir: Path,
-    report_user_dir: Path,
+    data_dir: Path,
     markets_parsed: Dict[str, Dict[str, Any]],
 ) -> Dict[str, Any] | None:
-    """Analyze a single user and save metrics to CSV under reports/luck_skill/users."""
+    """Analyze a single user and save metrics to SQLite."""
     print(f"Analyzing {user_key}...", file=sys.stderr)
 
-    trades_raw = load_trades_for_user(user_dir)
+    trades_raw = sqlite_load_all_user_trades(data_dir, user_key)
     if not trades_raw:
         print(f"  No trades found for {user_key}", file=sys.stderr)
         return None
@@ -745,6 +669,38 @@ def analyze_user(
         traceback.print_exc(file=sys.stderr)
         return None
 
+    pnl_by_market: Dict[str, float] = defaultdict(float)
+    for trade in result.trade_decompositions:
+        pnl_by_market[trade.condition_id] += trade.pnl_usdc
+
+    resolved_trade_count = len(result.trade_decompositions)
+    profitable_markets = sum(1 for pnl in pnl_by_market.values() if pnl > 0)
+    losing_markets = sum(1 for pnl in pnl_by_market.values() if pnl < 0)
+    pnl_market_count = profitable_markets + losing_markets
+    profitable_market_ratio = (
+        profitable_markets / pnl_market_count
+        if pnl_market_count > 0
+        else None
+    )
+    largest_market_profit = max(pnl_by_market.values(), default=0.0)
+    largest_market_loss = min(pnl_by_market.values(), default=0.0)
+    pnl_per_trade = result.raw_pnl_usdc / len(trades) if trades else None
+    pnl_per_resolved_trade = (
+        result.raw_pnl_usdc / resolved_trade_count
+        if resolved_trade_count > 0
+        else None
+    )
+    skill_per_trade = result.skill_usdc / len(trades) if trades else None
+    skill_per_resolved_trade = (
+        result.skill_usdc / resolved_trade_count
+        if resolved_trade_count > 0
+        else None
+    )
+    if pnl_per_trade is not None and skill_per_trade is not None:
+        monetized_edge_per_trade = min(pnl_per_trade, skill_per_trade)
+    else:
+        monetized_edge_per_trade = pnl_per_trade if pnl_per_trade is not None else skill_per_trade
+
     output_row = {
         "user_key": user_key,
         "total_trades": len(trades),
@@ -761,20 +717,22 @@ def analyze_user(
         "skill_roi": result.skill_roi,
         "raw_pnl_usdc": result.raw_pnl_usdc,
         "gross_trade_notional_usdc": result.gross_trade_notional_usdc,
+        "resolved_trade_count": resolved_trade_count,
+        "pnl_per_trade_usdc": pnl_per_trade,
+        "pnl_per_resolved_trade_usdc": pnl_per_resolved_trade,
+        "skill_per_trade_usdc": skill_per_trade,
+        "skill_per_resolved_trade_usdc": skill_per_resolved_trade,
+        "monetized_edge_per_trade_usdc": monetized_edge_per_trade,
+        "profitable_resolved_markets": profitable_markets,
+        "losing_resolved_markets": losing_markets,
+        "profitable_market_ratio": profitable_market_ratio,
+        "largest_market_profit_usdc": largest_market_profit,
+        "largest_market_loss_usdc": largest_market_loss,
         "warning_count": len(result.warnings),
     }
 
-    report_user_dir.mkdir(parents=True, exist_ok=True)
-    metrics_path = report_user_dir / "metrics.csv"
-    write_csv(metrics_path, [output_row])
-    print(f"  Saved metrics to {metrics_path}", file=sys.stderr)
-
-    if result.warnings:
-        warnings_path = report_user_dir / "warnings.txt"
-        with warnings_path.open("w", encoding="utf-8") as f:
-            for warning in result.warnings:
-                f.write(f"{warning}\n")
-        print(f"  Saved {len(result.warnings)} warnings to {warnings_path}", file=sys.stderr)
+    sqlite_upsert_user_metric(data_dir, output_row, warnings=result.warnings)
+    print("  Saved metrics to SQLite", file=sys.stderr)
 
     return output_row
 
@@ -788,42 +746,61 @@ def run_all_users_analysis(
     sleep_between_requests: float = 0.05,
     use_price_history: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Run luck/skill analysis for cached users and write reports outputs."""
+    """Run luck/skill analysis for users stored in SQLite."""
     data_dir = data_dir or Path("data")
     reports_dir = reports_dir or (Path("reports") / "luck_skill")
-    report_users_dir = reports_dir / "users"
-
-    reports_dir.mkdir(parents=True, exist_ok=True)
-    report_users_dir.mkdir(parents=True, exist_ok=True)
+    ensure_database(data_dir)
 
     if not data_dir.exists():
-        print("ERROR: ./data directory not found. Run download_luck_skill_data.py first.", file=sys.stderr)
-        return []
-
-    users_dir = data_dir / "user"
-    if not users_dir.exists():
-        print("ERROR: ./data/user directory not found.", file=sys.stderr)
+        print("ERROR: ./data directory not found. Run update commands first.", file=sys.stderr)
         return []
 
     requested_users = {str(user or "").strip() for user in (users or []) if str(user or "").strip()}
-    user_dirs = sorted([d for d in users_dir.iterdir() if d.is_dir()])
+    user_keys = sqlite_list_user_keys(data_dir, include_candidates=False)
+    missing_requested_users: List[str] = []
     if requested_users:
-        user_dirs = [d for d in user_dirs if d.name in requested_users]
-        missing_users = sorted(requested_users - {d.name for d in user_dirs})
-        for user_key in missing_users:
-            print(f"WARNING: requested user has no cache directory: {user_key}", file=sys.stderr)
+        profiles = sqlite_load_user_profile_rows(data_dir)
+        aliases = sqlite_load_user_alias_rows(data_dir)
+        aliases_by_user = {str(row.get("user_key") or ""): row for row in aliases.values() if row.get("user_key")}
+        user_keys = [
+            key
+            for key in user_keys
+            if user_matches_requested(key, profiles.get(key, {}), requested_users, aliases_by_user.get(key))
+        ]
+        matched_inputs = {
+            requested
+            for requested in requested_users
+            if any(
+                user_matches_requested(key, profiles.get(key, {}), {requested}, aliases_by_user.get(key))
+                for key in user_keys
+            )
+        }
+        missing_requested_users = sorted(requested_users - matched_inputs)
+        for user_key in missing_requested_users:
+            print(f"WARNING: requested user has no SQLite data: {user_key}", file=sys.stderr)
 
-    if hydrate_missing and user_dirs:
+    hydrate_targets = sorted(set(user_keys) | set(missing_requested_users)) if hydrate_missing else []
+    if hydrate_targets:
         hydrated, failed = hydrate_missing_users(
-            user_dirs,
+            hydrate_targets,
             data_dir,
             sleep_between_requests=sleep_between_requests,
         )
         print(
-            f"Hydration summary: hydrated={hydrated}, failed={failed}, total_users={len(user_dirs)}",
+            f"Hydration summary: hydrated={hydrated}, failed={failed}, total_users={len(hydrate_targets)}",
             file=sys.stderr,
         )
-    elif user_dirs:
+        user_keys = sqlite_list_user_keys(data_dir, include_candidates=False)
+        if requested_users:
+            profiles = sqlite_load_user_profile_rows(data_dir)
+            aliases = sqlite_load_user_alias_rows(data_dir)
+            aliases_by_user = {str(row.get("user_key") or ""): row for row in aliases.values() if row.get("user_key")}
+            user_keys = [
+                key
+                for key in user_keys
+                if user_matches_requested(key, profiles.get(key, {}), requested_users, aliases_by_user.get(key))
+            ]
+    elif user_keys:
         print(
             "Hydration skipped; luck/skill analysis is offline by default. "
             "Pass --hydrate-missing-users to download missing trades first.",
@@ -850,14 +827,12 @@ def run_all_users_analysis(
     markets_parsed = {cid: parse_market_row(m, price_history) for cid, m in markets.items()}
     print(f"Parsed {len(markets_parsed)} markets", file=sys.stderr)
 
-    print(f"Found {len(user_dirs)} user(s) to analyze", file=sys.stderr)
+    print(f"Found {len(user_keys)} user(s) to analyze", file=sys.stderr)
 
     all_rows: List[Dict[str, Any]] = []
-    for user_dir in user_dirs:
-        user_key = user_dir.name
+    for user_key in user_keys:
         try:
-            report_user_dir = report_users_dir / user_key
-            row = analyze_user(user_key, user_dir, report_user_dir, markets_parsed)
+            row = analyze_user(user_key, data_dir, markets_parsed)
             if row is not None:
                 all_rows.append(row)
                 update_watermark(
@@ -875,18 +850,7 @@ def run_all_users_analysis(
             print(f"ERROR analyzing {user_key}: {exc}", file=sys.stderr)
 
     if all_rows:
-        all_metrics_path = reports_dir / "metrics_all_users.csv"
-        if requested_users:
-            merged_rows = read_existing_metrics(all_metrics_path)
-            for row in all_rows:
-                user_key = str(row.get("user_key") or "")
-                if user_key:
-                    merged_rows[user_key] = row
-            output_rows = [merged_rows[key] for key in sorted(merged_rows)]
-        else:
-            output_rows = all_rows
-        write_csv(all_metrics_path, output_rows)
-        print(f"Saved aggregate metrics to {all_metrics_path}", file=sys.stderr)
+        print(f"Saved {len(all_rows)} user metric row(s) to SQLite", file=sys.stderr)
 
     update_watermark(
         data_dir,
@@ -894,7 +858,7 @@ def run_all_users_analysis(
         "luck_skill",
         {
             "reports_dir": str(reports_dir),
-            "users_found": len(user_dirs),
+            "users_found": len(user_keys),
             "users_analyzed": len(all_rows),
             "requested_users": sorted(requested_users),
             "hydrate_missing": bool(hydrate_missing),
@@ -906,10 +870,64 @@ def run_all_users_analysis(
     return all_rows
 
 
+def load_users_file(path: Path) -> List[str]:
+    users: List[str] = []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                value = line.strip()
+                if value and not value.startswith("#"):
+                    users.append(value)
+    except OSError as exc:
+        print(f"Failed reading users file {path}: {exc}", file=sys.stderr)
+    return users
+
+
+def collect_requested_users(users: Sequence[str] | None, users_files: Sequence[str] | None) -> List[str]:
+    requested: List[str] = []
+    seen = set()
+
+    def add(value: Any) -> None:
+        text = str(value or "").strip()
+        if not text:
+            return
+        key = text.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        requested.append(text)
+
+    for user in users or []:
+        add(user)
+    for users_file in users_files or []:
+        for user in load_users_file(Path(users_file)):
+            add(user)
+    return requested
+
+
+def user_matches_requested(
+    user_key: str,
+    profile: Dict[str, Any],
+    requested_users: set[str],
+    alias: Dict[str, Any] | None = None,
+) -> bool:
+    alias = alias or {}
+    requested = {value.lower().lstrip("@") for value in requested_users}
+    candidates = {
+        str(user_key or "").lower().lstrip("@"),
+        str(profile.get("input_user") or "").lower().lstrip("@"),
+        str(profile.get("name") or "").lower().lstrip("@"),
+        str(profile.get("pseudonym") or "").lower().lstrip("@"),
+        str(profile.get("profile_name") or "").lower().lstrip("@"),
+        str(profile.get("profile_pseudonym") or "").lower().lstrip("@"),
+        str(alias.get("alias") or "").lower().lstrip("@"),
+        str(alias.get("display_name") or "").lower().lstrip("@"),
+    }
+    return bool(requested & {value for value in candidates if value})
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Run luck/skill analysis for cached users under data/user."
-    )
+    parser = argparse.ArgumentParser(description="Run luck/skill analysis from the local database.")
     parser.add_argument("--data-dir", default="data", help="Data directory root (default: data)")
     parser.add_argument(
         "--reports-dir",
@@ -919,7 +937,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--user",
         action="append",
-        help="Analyze only this cached user key. Repeat to analyze more than one user.",
+        help="Analyze only this user key. Repeat to analyze more than one user.",
+    )
+    parser.add_argument(
+        "--users-file",
+        action="append",
+        help="Text file containing user keys, one per line.",
     )
     parser.add_argument(
         "--hydrate-missing-users",
@@ -941,8 +964,8 @@ def parse_args() -> argparse.Namespace:
         "--use-price-history",
         action="store_true",
         help=(
-            "Load cached price-history files as a fallback for settlement prices. "
-            "This can be slow on large caches and is disabled by default."
+            "Load stored price-history rows as a fallback for settlement prices. "
+            "This can be slow on large databases and is disabled by default."
         ),
     )
     return parser.parse_args()
@@ -953,7 +976,7 @@ def main() -> None:
     run_all_users_analysis(
         data_dir=Path(args.data_dir),
         reports_dir=Path(args.reports_dir),
-        users=args.user,
+        users=collect_requested_users(args.user, args.users_file),
         hydrate_missing=args.hydrate_missing_users and not args.no_hydrate_missing_users,
         sleep_between_requests=args.sleep,
         use_price_history=args.use_price_history,

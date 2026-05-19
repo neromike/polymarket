@@ -415,17 +415,6 @@ def update_watermark(
     return existing
 
 
-def _count_files(path: Path, pattern: str = "*.csv") -> int:
-    if not path.exists():
-        return 0
-    count = 0
-    for _, _, filenames in os.walk(path):
-        for filename in filenames:
-            if Path(filename).match(pattern):
-                count += 1
-    return count
-
-
 def _file_mb(path: Path) -> float:
     if not path.exists():
         return 0.0
@@ -452,31 +441,67 @@ def build_inventory(
 
     data_path = Path(data_dir)
     reports_path = Path(report_dir)
-    users_root = data_path / "user"
-    users = [p for p in users_root.iterdir() if p.is_dir()] if users_root.exists() else []
+    sqlite_counts: Dict[str, int] = {}
+    try:
+        from sqlite_store import connect, count_market_rows, default_db_path, sqlite_database_available
+
+        if sqlite_database_available(data_path):
+            conn = connect(default_db_path(data_path))
+            try:
+                def count(sql: str) -> int:
+                    try:
+                        return int(conn.execute(sql).fetchone()[0])
+                    except Exception:
+                        return 0
+
+                sqlite_counts = {
+                    "user_profiles": count("SELECT COUNT(*) FROM user_profiles"),
+                    "indexed_user_trades": count("SELECT COUNT(*) FROM indexed_user_trades"),
+                    "distinct_users": count(
+                        """
+                        SELECT COUNT(*) FROM (
+                            SELECT user_key FROM user_profiles
+                            UNION SELECT user_key FROM user_metrics
+                            UNION SELECT user_key FROM user_trades
+                            UNION SELECT user_key FROM user_aliases
+                        )
+                        """
+                    ),
+                    "user_trades": count("SELECT COUNT(*) FROM user_trades"),
+                    "market_current": count("SELECT COUNT(*) FROM market_current"),
+                    "indexed_market_trades": count("SELECT COUNT(*) FROM indexed_market_trades"),
+                    "market_trades": count("SELECT COUNT(*) FROM market_trades"),
+                    "indexed_price_history": count("SELECT COUNT(*) FROM indexed_price_history"),
+                    "price_history": count("SELECT COUNT(*) FROM price_history"),
+                    "price_history_assets": count("SELECT COUNT(DISTINCT asset) FROM price_history"),
+                    "user_metrics": count("SELECT COUNT(*) FROM user_metrics"),
+                    "scanner_candidate_users": count("SELECT COUNT(*) FROM scanner_candidate_users"),
+                }
+                if not sqlite_counts["market_current"]:
+                    sqlite_counts["market_current"] = count_market_rows(data_path)
+            finally:
+                conn.close()
+    except Exception:
+        sqlite_counts = {}
 
     payload = {
         "generated_at": utc_now_iso(),
         "data_dir": str(data_path),
         "reports_dir": str(reports_path),
-        "user_count": len(users),
-        "user_trade_files": _count_files(data_path / "user"),
-        "market_metadata_files": _count_files(data_path / "market" / "markets"),
-        "price_history_files": _count_files(data_path / "market" / "prices-history"),
-        "market_trade_cache_files": _count_files(data_path / "market" / "trades"),
+        "user_count": sqlite_counts.get("distinct_users")
+        or sqlite_counts.get("user_profiles")
+        or sqlite_counts.get("indexed_user_trades")
+        or 0,
+        "user_trade_rows": sqlite_counts.get("user_trades") or 0,
+        "market_metadata_rows": sqlite_counts.get("market_current") or 0,
+        "price_history_assets": sqlite_counts.get("price_history_assets") or sqlite_counts.get("indexed_price_history") or 0,
+        "market_trade_sets": sqlite_counts.get("indexed_market_trades") or 0,
+        "sqlite": sqlite_counts,
         "reports": {
             "user_dashboard_html_mb": _file_mb(reports_path / "dashboard.html"),
             "market_dashboard_html_mb": _file_mb(reports_path / "market_scanner_dashboard.html"),
-            "candidate_users_csv_mb": _file_mb(reports_path / "market_scanner" / "candidate_users.csv"),
-            "user_event_scores_csv_mb": _file_mb(reports_path / "market_scanner" / "user_event_scores.csv"),
         },
     }
-    payload["total_data_csv_files"] = (
-        payload["user_trade_files"]
-        + payload["market_metadata_files"]
-        + payload["price_history_files"]
-        + payload["market_trade_cache_files"]
-    )
     atomic_write_json(cache_path, payload)
     return payload
 

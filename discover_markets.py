@@ -10,10 +10,16 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from api import ApiError, MetadataCache, PolymarketClient
-from cli import write_csv
 from config import GAMMA_BASE, AnalyzerConfig
-from download_data import fetch_price_history_adaptive, flatten_market_row, sanitize_file_component
+from download_data import fetch_price_history_adaptive, flatten_market_row
 from runtime_state import update_watermark
+from sqlite_store import (
+    ensure_database,
+    market_condition_ids as sqlite_market_condition_ids,
+    price_history_cached as sqlite_price_history_cached,
+    upsert_markets as sqlite_upsert_markets,
+    upsert_price_history as sqlite_upsert_price_history,
+)
 from utils import parse_jsonish_list, safe_float
 
 
@@ -73,7 +79,7 @@ CONDITION_RE = re.compile(r"^0x[a-fA-F0-9]{64}$")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Discover and cache high-value Polymarket markets for jump-first user scanning."
+        description="Discover and store high-value Polymarket markets for jump-first user scanning."
     )
     parser.add_argument("--data-dir", default="data", help="Workspace data directory (default: data)")
     parser.add_argument("--limit-pages", type=int, default=10, help="Max pages from /markets/keyset")
@@ -94,16 +100,16 @@ def parse_args() -> argparse.Namespace:
         "--max-markets",
         type=int,
         default=250,
-        help="Maximum selected markets to cache (default: 250)",
+        help="Maximum selected markets to store (default: 250)",
     )
     parser.add_argument(
         "--market",
         action="append",
-        help="Specific conditionId to cache/update. Repeat to refresh more than one market.",
+        help="Specific conditionId to store/update. Repeat to refresh more than one market.",
     )
     parser.add_argument(
         "--markets-file",
-        help="Text file containing conditionIds to cache/update, one per line.",
+        help="Text file containing conditionIds to store/update, one per line.",
     )
     parser.add_argument(
         "--closed",
@@ -126,17 +132,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-price-history",
         action="store_true",
-        help="Skip CLOB price-history caching",
+        help="Skip CLOB price-history storage",
     )
     parser.add_argument(
         "--force-market-refresh",
         action="store_true",
-        help="Rewrite cached market metadata even when market cache file exists.",
+        help="Rewrite stored market metadata even when the market already exists.",
     )
     parser.add_argument(
         "--force-price-refresh",
         action="store_true",
-        help="Refetch and rewrite price-history files even when monthly cache files exist.",
+        help="Refetch and rewrite price-history rows even when rows already exist.",
     )
     return parser.parse_args()
 
@@ -351,39 +357,14 @@ def month_key_for_market(market: Dict[str, Any]) -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m")
 
 
-def load_cached_condition_ids(data_dir: Path) -> Set[str]:
-    markets_root = data_dir / "market" / "markets"
-    if not markets_root.exists():
-        return set()
-
-    cached: Set[str] = set()
-    for csv_file in markets_root.rglob("market_*.csv"):
-        stem = csv_file.stem
-        if not stem.startswith("market_"):
-            continue
-        condition_id = stem[len("market_") :].strip().lower()
-        if CONDITION_RE.match(condition_id):
-            cached.add(condition_id)
-    return cached
+def load_stored_condition_ids(data_dir: Path) -> Set[str]:
+    return sqlite_market_condition_ids(data_dir)
 
 
-def market_cache_path(data_dir: Path, market: Dict[str, Any]) -> Optional[Path]:
-    condition_id = str(market.get("conditionId") or "")
-    if not condition_id:
-        return None
-    month = month_key_for_market(market)
-    out_dir = data_dir / "market" / "markets" / month
-    return out_dir / f"market_{sanitize_file_component(condition_id)}.csv"
-
-
-def write_market_cache(data_dir: Path, market: Dict[str, Any]) -> None:
-    out_path = market_cache_path(data_dir, market)
-    if out_path is None:
-        return
-
+def write_market_row(data_dir: Path, market: Dict[str, Any]) -> None:
     row = flatten_market_row(market)
     row["conditionId"] = str(market.get("conditionId") or "")
-    write_csv(out_path, [row])
+    sqlite_upsert_markets(data_dir, [row])
 
 
 def iter_token_ids(market: Dict[str, Any]) -> Iterable[str]:
@@ -409,25 +390,16 @@ def months_in_window(start_ts: int, end_ts: int) -> Set[str]:
     return out
 
 
-def token_price_history_cached(
+def token_price_history_stored(
     data_dir: Path,
     token_id: str,
     start_ts: int,
     end_ts: int,
 ) -> bool:
-    needed_months = months_in_window(start_ts, end_ts)
-    if not needed_months:
-        return False
-
-    file_name = f"price_history_asset_{sanitize_file_component(token_id, 'asset')}.csv"
-    for month in needed_months:
-        out_path = data_dir / "market" / "prices-history" / month / file_name
-        if not out_path.exists():
-            return False
-    return True
+    return sqlite_price_history_cached(data_dir, token_id, start_ts, end_ts)
 
 
-def write_price_history_cache(
+def write_price_history_rows(
     client: PolymarketClient,
     data_dir: Path,
     market: Dict[str, Any],
@@ -439,7 +411,7 @@ def write_price_history_cache(
     now_ts = unix_now()
     start_ts = now_ts - max(1, window_days) * 86400
 
-    written_files = 0
+    written_rows = 0
     tokens_with_data = 0
 
     for token_id in iter_token_ids(market):
@@ -475,16 +447,13 @@ def write_price_history_cache(
                 }
             )
 
-        for month, rows in by_month.items():
-            out_dir = data_dir / "market" / "prices-history" / month
-            out_path = out_dir / f"price_history_asset_{sanitize_file_component(token_id, 'asset')}.csv"
-            write_csv(out_path, rows)
-            written_files += 1
+        for _month, rows in by_month.items():
+            written_rows += sqlite_upsert_price_history(data_dir, rows)
 
         if by_month:
             tokens_with_data += 1
 
-    return written_files, tokens_with_data
+    return written_rows, tokens_with_data
 
 
 def main() -> None:
@@ -493,6 +462,7 @@ def main() -> None:
     client = PolymarketClient(cfg)
 
     data_dir = Path(args.data_dir)
+    ensure_database(data_dir)
     requested_markets = []
     seen_requested = set()
     for value in [*(args.market or []), *load_market_ids_file(args.markets_file)]:
@@ -526,20 +496,20 @@ def main() -> None:
             min_liquidity=args.min_liquidity,
         )
 
-    cached_condition_ids = set()
+    stored_condition_ids = set()
     if not args.force_market_refresh:
-        cached_condition_ids = load_cached_condition_ids(data_dir)
-        if cached_condition_ids:
+        stored_condition_ids = load_stored_condition_ids(data_dir)
+        if stored_condition_ids:
             before = len(markets)
             markets = [
                 m
                 for m in markets
-                if str(m.get("conditionId") or "").strip().lower() not in cached_condition_ids
+                if str(m.get("conditionId") or "").strip().lower() not in stored_condition_ids
             ]
             skipped = before - len(markets)
             print(
                 (
-                    f"Filtered cached markets from discovery set: skipped={skipped}, "
+                    f"Filtered stored markets from discovery set: skipped={skipped}, "
                     f"remaining_new_candidates={len(markets)}"
                 ),
                 file=sys.stderr,
@@ -554,7 +524,7 @@ def main() -> None:
             {
                 "markets_fetched": 0,
                 "markets_written": 0,
-                "price_files_written": 0,
+                "price_rows_written": 0,
                 "closed": bool(args.closed),
                 "requested_markets": len(requested_markets),
             },
@@ -563,7 +533,7 @@ def main() -> None:
 
     if requested_markets:
         selected = [(market, {}) for market in markets]
-        print(f"Selected {len(selected)} requested markets for caching.", file=sys.stderr)
+        print(f"Selected {len(selected)} requested markets for storage.", file=sys.stderr)
     else:
         diversity = diversity_scores(markets)
 
@@ -582,19 +552,19 @@ def main() -> None:
 
         scored.sort(key=lambda x: x[1]["market_score"], reverse=True)
         selected = scored[: max(0, args.max_markets)] if args.max_markets > 0 else scored
-        print(f"Selected {len(selected)} new markets for caching.", file=sys.stderr)
+        print(f"Selected {len(selected)} new markets for storage.", file=sys.stderr)
 
     market_written = 0
-    market_skipped_cached = 0
-    price_files_written = 0
-    price_tokens_skipped_cached = 0
+    market_skipped_existing = 0
+    price_rows_written = 0
+    price_tokens_skipped_existing = 0
 
     for idx, (market, _) in enumerate(selected, start=1):
-        m_path = market_cache_path(data_dir, market)
-        if m_path is not None and m_path.exists() and not args.force_market_refresh:
-            market_skipped_cached += 1
+        condition_id = str(market.get("conditionId") or "").strip().lower()
+        if condition_id in stored_condition_ids and not args.force_market_refresh:
+            market_skipped_existing += 1
         else:
-            write_market_cache(data_dir, market)
+            write_market_row(data_dir, market)
             market_written += 1
 
         if not args.skip_price_history:
@@ -605,33 +575,33 @@ def main() -> None:
             for token_id in iter_token_ids(market):
                 if args.force_price_refresh:
                     tokens_to_fetch.append(token_id)
-                elif token_price_history_cached(data_dir, token_id, start_ts, now_ts):
-                    price_tokens_skipped_cached += 1
+                elif token_price_history_stored(data_dir, token_id, start_ts, now_ts):
+                    price_tokens_skipped_existing += 1
                 else:
                     tokens_to_fetch.append(token_id)
 
             if tokens_to_fetch:
                 market_for_prices = dict(market)
                 market_for_prices["clobTokenIds"] = tokens_to_fetch
-                written, _ = write_price_history_cache(
+                written, _ = write_price_history_rows(
                     client,
                     data_dir,
                     market_for_prices,
                     fidelity_minutes=args.price_fidelity_minutes,
                     window_days=args.price_window_days,
                 )
-                price_files_written += written
+                price_rows_written += written
 
         if idx % 25 == 0 or idx == len(selected):
-            print(f"Cached {idx}/{len(selected)} selected markets", file=sys.stderr)
+            print(f"Stored {idx}/{len(selected)} selected markets", file=sys.stderr)
 
     print(
         (
-            "Discovery cache summary: "
+            "Discovery storage summary: "
             f"markets_written={market_written}, "
-            f"markets_skipped_cached={market_skipped_cached}, "
-            f"price_files_written={price_files_written}, "
-            f"price_tokens_skipped_cached={price_tokens_skipped_cached}"
+            f"markets_skipped_existing={market_skipped_existing}, "
+            f"price_rows_written={price_rows_written}, "
+            f"price_tokens_skipped_existing={price_tokens_skipped_existing}"
         ),
         file=sys.stderr,
     )
@@ -643,9 +613,9 @@ def main() -> None:
             "markets_fetched": len(markets),
             "markets_selected": len(selected),
             "markets_written": market_written,
-            "markets_skipped_cached": market_skipped_cached,
-            "price_files_written": price_files_written,
-            "price_tokens_skipped_cached": price_tokens_skipped_cached,
+            "markets_skipped_existing": market_skipped_existing,
+            "price_rows_written": price_rows_written,
+            "price_tokens_skipped_existing": price_tokens_skipped_existing,
             "closed": bool(args.closed),
             "force_market_refresh": bool(args.force_market_refresh),
             "force_price_refresh": bool(args.force_price_refresh),

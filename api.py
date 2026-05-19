@@ -27,8 +27,19 @@ class ApiError(RuntimeError):
 class PolymarketClient:
     def __init__(self, cfg: AnalyzerConfig) -> None:
         self.cfg = cfg
+        self.session = self._new_session()
+
+    def _new_session(self) -> requests.Session:
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "polymarket-luck-skill-analyzer/1.0"})
+        return self.session
+
+    def _reset_session(self) -> None:
+        try:
+            self.session.close()
+        except Exception:
+            pass
+        self.session = self._new_session()
 
     def get_json(
         self,
@@ -37,12 +48,14 @@ class PolymarketClient:
         params: Optional[Dict[str, Any]] = None,
         *,
         allow_404: bool = False,
+        max_retries: Optional[int] = None,
     ) -> Any:
         url = f"{base}{path}"
         encoded_params = self._encode_params(params or {})
+        retry_count = max(1, int(max_retries if max_retries is not None else self.cfg.max_retries))
 
         last_response: Optional[requests.Response] = None
-        for attempt in range(self.cfg.max_retries):
+        for attempt in range(retry_count):
             if self.cfg.sleep_between_requests:
                 time.sleep(self.cfg.sleep_between_requests)
 
@@ -53,7 +66,8 @@ class PolymarketClient:
                     timeout=self.cfg.timeout_seconds,
                 )
             except requests.RequestException as exc:
-                if attempt == self.cfg.max_retries - 1:
+                self._reset_session()
+                if attempt == retry_count - 1:
                     raise ApiError(f"Request failed for {url}: {exc}") from exc
                 time.sleep(min(2**attempt, 30))
                 continue

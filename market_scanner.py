@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import math
 import re
 import sys
@@ -13,10 +12,16 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from api import PolymarketClient, fetch_paginated
-from cli import write_csv
 from config import DATA_BASE, AnalyzerConfig
-from download_data import sanitize_file_component
 from runtime_state import update_watermark
+from sqlite_store import (
+    ensure_database,
+    load_all_market_rows as sqlite_load_all_market_rows,
+    load_market_trade_rows as sqlite_load_market_trade_rows,
+    load_price_history_points as sqlite_load_price_history_points,
+    upsert_market_trades as sqlite_upsert_market_trades,
+    upsert_scanner_results as sqlite_upsert_scanner_results,
+)
 from utils import parse_jsonish_list, safe_float
 
 
@@ -115,20 +120,12 @@ def parse_args() -> argparse.Namespace:
         action="append",
         help=(
             "Optional specific market target(s): conditionId or slug. "
-            "Repeatable. If omitted, scans all cached markets."
+            "Repeatable. If omitted, scans all stored markets."
         ),
     )
     parser.add_argument(
         "--markets-file",
         help="Text file containing market targets, one conditionId or slug per line.",
-    )
-    parser.add_argument(
-        "--market-trades-cache-dir",
-        default="market/trades",
-        help=(
-            "Relative path under data-dir for cached market trades "
-            "(default: market/trades)"
-        ),
     )
     parser.add_argument(
         "--refresh-market-trades",
@@ -138,17 +135,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--allow-api",
         action="store_true",
-        help="Allow market-trade API calls during scanning. Default is cached data only.",
+        help="Allow market-trade API calls during scanning. Default is local database only.",
     )
     parser.add_argument(
         "--no-api",
         action="store_true",
-        help="Use only cached market trades. This is the default and kept for compatibility.",
+        help="Use only local market trades. This is the default.",
     )
     parser.add_argument(
         "--cache-trades-only",
         action="store_true",
-        help="Refresh market-trade caches and exit without running jump analysis.",
+        help="Refresh market-trade rows and exit without running jump analysis.",
     )
     parser.add_argument(
         "--event-cluster-window",
@@ -264,33 +261,19 @@ def user_dir_key(value: str) -> str:
     return text or "unknown_user"
 
 
-def seed_user_dirs_for_candidates(
+def count_selected_candidates(
     data_dir: Path,
     candidates: Sequence[Dict[str, Any]],
     accepted_confidences: Set[str],
 ) -> Tuple[int, int]:
-    users_root = data_dir / "user"
-    users_root.mkdir(parents=True, exist_ok=True)
-
-    created = 0
-    existing = 0
-    for row in candidates:
-        confidence = str(row.get("confidence_level") or "").strip().lower()
-        if confidence not in accepted_confidences:
-            continue
-
-        wallet = str(row.get("wallet") or "").strip()
-        if not wallet:
-            continue
-
-        folder = users_root / user_dir_key(wallet)
-        if folder.exists():
-            existing += 1
-            continue
-        folder.mkdir(parents=True, exist_ok=True)
-        created += 1
-
-    return created, existing
+    accepted = {str(value).strip().lower() for value in accepted_confidences}
+    existing = sum(
+        1
+        for row in candidates
+        if str(row.get("wallet") or "").strip()
+        and str(row.get("confidence_level") or "").strip().lower() in accepted
+    )
+    return 0, existing
 
 
 def trade_uid(trade: Dict[str, Any], idx: int = 0) -> str:
@@ -312,29 +295,14 @@ def trade_uid(trade: Dict[str, Any], idx: int = 0) -> str:
     return "|".join(pieces)
 
 
-def market_trade_cache_path(data_dir: Path, cache_dir: str, condition_id: str) -> Path:
-    return data_dir / cache_dir / condition_id / "trades.csv"
-
-
-def load_cached_market_trades(data_dir: Path, cache_dir: str, condition_id: str) -> List[Dict[str, Any]]:
-    path = market_trade_cache_path(data_dir, cache_dir, condition_id)
-    if not path.exists():
-        return []
-    try:
-        with path.open("r", newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            rows = [dict(row) for row in reader]
-    except OSError as exc:
-        print(f"Failed reading cached trades for {condition_id}: {exc}", file=sys.stderr)
-        return []
-
+def load_cached_market_trades(data_dir: Path, condition_id: str) -> List[Dict[str, Any]]:
+    rows = sqlite_load_market_trade_rows(data_dir, condition_id)
     rows.sort(key=lambda r: safe_float(r.get("timestamp")) or -1.0)
     return rows
 
 
-def write_market_trade_cache(data_dir: Path, cache_dir: str, condition_id: str, rows: Sequence[Dict[str, Any]]) -> None:
-    path = market_trade_cache_path(data_dir, cache_dir, condition_id)
-    write_csv(path, rows)
+def write_market_trade_cache(data_dir: Path, condition_id: str, rows: Sequence[Dict[str, Any]]) -> None:
+    sqlite_upsert_market_trades(data_dir, condition_id, rows, replace_market=True)
 
 
 def fetch_market_trades_incremental(
@@ -426,50 +394,40 @@ def build_event_cluster_id(event: JumpEvent, cluster_window_seconds: int) -> str
 
 
 def load_markets(data_dir: Path) -> Dict[str, MarketInfo]:
-    markets_root = data_dir / "market" / "markets"
-    if not markets_root.exists():
-        return {}
-
     result: Dict[str, MarketInfo] = {}
-    for csv_file in sorted(markets_root.rglob("market_*.csv")):
-        try:
-            with csv_file.open("r", newline="", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    condition_id = str(row.get("conditionId") or "")
-                    if not condition_id:
-                        continue
-                    outcomes = [str(x) for x in parse_jsonish_list(row.get("outcomes"))]
-                    token_ids = [str(x) for x in parse_jsonish_list(row.get("clobTokenIds"))]
-                    if len(token_ids) < 2 or len(outcomes) < 2:
-                        continue
+    for row in sqlite_load_all_market_rows(data_dir).values():
+        condition_id = str(row.get("conditionId") or "")
+        if not condition_id:
+            continue
+        outcomes = [str(x) for x in parse_jsonish_list(row.get("outcomes"))]
+        token_ids = [str(x) for x in parse_jsonish_list(row.get("clobTokenIds"))]
+        if len(token_ids) < 2 or len(outcomes) < 2:
+            continue
 
-                    yes_idx = None
-                    for i, label in enumerate(outcomes):
-                        if label.strip().lower() == "yes":
-                            yes_idx = i
-                            break
-                    if yes_idx is None:
-                        yes_idx = 0
+        yes_idx = None
+        for i, label in enumerate(outcomes):
+            if label.strip().lower() == "yes":
+                yes_idx = i
+                break
+        if yes_idx is None:
+            yes_idx = 0
 
-                    if yes_idx >= len(token_ids):
-                        continue
+        if yes_idx >= len(token_ids):
+            continue
 
-                    asset_outcome = {}
-                    for i, asset in enumerate(token_ids):
-                        label = outcomes[i] if i < len(outcomes) else f"outcome_{i}"
-                        asset_outcome[asset] = str(label)
+        asset_outcome = {}
+        for i, asset in enumerate(token_ids):
+            label = outcomes[i] if i < len(outcomes) else f"outcome_{i}"
+            asset_outcome[asset] = str(label)
 
-                    result[condition_id] = MarketInfo(
-                        condition_id=condition_id,
-                        question=str(row.get("question") or ""),
-                        slug=str(row.get("slug") or ""),
-                        event_slug=str(row.get("eventSlug") or ""),
-                        yes_asset=token_ids[yes_idx],
-                        asset_outcome=asset_outcome,
-                    )
-        except OSError as exc:
-            print(f"Failed to read {csv_file}: {exc}", file=sys.stderr)
+        result[condition_id] = MarketInfo(
+            condition_id=condition_id,
+            question=str(row.get("question") or ""),
+            slug=str(row.get("slug") or ""),
+            event_slug=str(row.get("eventSlug") or ""),
+            yes_asset=token_ids[yes_idx],
+            asset_outcome=asset_outcome,
+        )
     return result
 
 
@@ -477,49 +435,7 @@ def load_price_history_by_asset(
     data_dir: Path,
     assets: Optional[Set[str]] = None,
 ) -> Dict[str, List[Tuple[float, float]]]:
-    prices_root = data_dir / "market" / "prices-history"
-    if not prices_root.exists():
-        return {}
-
-    by_asset: Dict[str, Dict[int, float]] = defaultdict(dict)
-    csv_files: List[Path] = []
-    if assets and len(assets) <= 500:
-        file_names = {
-            f"price_history_asset_{sanitize_file_component(asset, 'asset')}.csv"
-            for asset in assets
-            if str(asset).strip()
-        }
-        for month_dir in sorted(p for p in prices_root.iterdir() if p.is_dir()):
-            for file_name in file_names:
-                csv_file = month_dir / file_name
-                if csv_file.exists():
-                    csv_files.append(csv_file)
-    else:
-        csv_files = sorted(prices_root.rglob("price_history_asset_*.csv"))
-
-    asset_filter = set(assets or [])
-    for csv_file in csv_files:
-        try:
-            with csv_file.open("r", newline="", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    asset = str(row.get("asset") or "")
-                    if asset_filter and asset not in asset_filter:
-                        continue
-                    ts = safe_float(row.get("timestamp"))
-                    px = safe_float(row.get("price"))
-                    if not asset or ts is None or px is None:
-                        continue
-                    by_asset[asset][int(ts)] = px
-        except OSError as exc:
-            print(f"Failed to read {csv_file}: {exc}", file=sys.stderr)
-
-    result: Dict[str, List[Tuple[float, float]]] = {}
-    for asset, values in by_asset.items():
-        points = [(float(ts), px) for ts, px in sorted(values.items())]
-        if points:
-            result[asset] = points
-    return result
+    return sqlite_load_price_history_points(data_dir, assets)
 
 
 def estimate_logit_volatility(points: Sequence[Tuple[float, float]]) -> float:
@@ -653,7 +569,6 @@ def signed_yes_exposure(trade: Dict[str, Any], market: MarketInfo) -> Optional[f
 def market_trade_rows(
     client: PolymarketClient,
     data_dir: Path,
-    cache_dir: str,
     condition_id: str,
     *,
     page_limit: int,
@@ -661,7 +576,7 @@ def market_trade_rows(
     allow_api: bool,
     force_refresh: bool,
 ) -> List[Dict[str, Any]]:
-    cached_rows = load_cached_market_trades(data_dir, cache_dir, condition_id)
+    cached_rows = load_cached_market_trades(data_dir, condition_id)
     if not allow_api:
         return cached_rows
 
@@ -679,7 +594,7 @@ def market_trade_rows(
             progress_label=f"market trades {condition_id[:10]}...",
         )
         fetched.sort(key=lambda r: safe_float(r.get("timestamp")) or -1.0)
-        write_market_trade_cache(data_dir, cache_dir, condition_id, fetched)
+        write_market_trade_cache(data_dir, condition_id, fetched)
         return fetched
 
     seen_uids = {trade_uid(row, i) for i, row in enumerate(cached_rows)}
@@ -700,7 +615,7 @@ def market_trade_rows(
         dedup[trade_uid(row, i)] = row
     out = list(dedup.values())
     out.sort(key=lambda r: safe_float(r.get("timestamp")) or -1.0)
-    write_market_trade_cache(data_dir, cache_dir, condition_id, out)
+    write_market_trade_cache(data_dir, condition_id, out)
     return out
 
 
@@ -772,6 +687,7 @@ def main() -> None:
     args = parse_args()
     data_dir = Path(args.data_dir)
     out_dir = Path(args.out_dir)
+    ensure_database(data_dir)
 
     lookbacks = [parse_duration_seconds(x) for x in args.lookback_windows.split(",") if x.strip()]
     if not lookbacks:
@@ -784,7 +700,7 @@ def main() -> None:
 
     markets = load_markets(data_dir)
     if not markets:
-        print(f"ERROR: No market metadata found under {data_dir / 'market' / 'markets'}", file=sys.stderr)
+        print("ERROR: No market metadata found in SQLite. Run update markets first.", file=sys.stderr)
         sys.exit(1)
 
     cfg = AnalyzerConfig(
@@ -807,7 +723,6 @@ def main() -> None:
             rows = market_trade_rows(
                 client,
                 data_dir,
-                args.market_trades_cache_dir,
                 condition_id,
                 page_limit=cfg.trades_page_limit,
                 max_offset=cfg.trades_max_offset,
@@ -829,7 +744,6 @@ def main() -> None:
             {
                 "markets_processed": refreshed,
                 "rows_cached": rows_cached,
-                "cache_dir": args.market_trades_cache_dir,
                 "force_refresh": bool(args.refresh_market_trades),
             },
         )
@@ -839,7 +753,7 @@ def main() -> None:
     selected_yes_assets = {markets[cid].yes_asset for cid in market_ids if cid in markets}
     by_asset = load_price_history_by_asset(data_dir, selected_yes_assets)
     if not by_asset:
-        print(f"ERROR: No price history found under {data_dir / 'market' / 'prices-history'}", file=sys.stderr)
+        print("ERROR: No price history found in SQLite. Run update markets without --skip-price-history.", file=sys.stderr)
         sys.exit(1)
 
     events: List[JumpEvent] = []
@@ -848,7 +762,7 @@ def main() -> None:
         print("Scanner API access enabled for missing market-trade caches.", file=sys.stderr)
     else:
         print(
-            "Scanner using cached market trades only. Use update market-trades or pass --allow-api to refresh.",
+            "Scanner using stored market trades only. Use update market-trades or pass --allow-api to refresh.",
             file=sys.stderr,
         )
 
@@ -877,9 +791,7 @@ def main() -> None:
 
     if not events:
         print("No jump events detected with current thresholds.", file=sys.stderr)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        write_csv(out_dir / "jump_events.csv", [])
-        write_csv(out_dir / "candidate_users.csv", [])
+        sqlite_upsert_scanner_results(data_dir, jump_events=[], user_event_scores=[], candidate_users=[])
         update_watermark(
             data_dir,
             "analysis",
@@ -914,7 +826,6 @@ def main() -> None:
             trades_cache[event.condition_id] = market_trade_rows(
                 client,
                 data_dir,
-                args.market_trades_cache_dir,
                 event.condition_id,
                 page_limit=cfg.trades_page_limit,
                 max_offset=cfg.trades_max_offset,
@@ -994,10 +905,7 @@ def main() -> None:
 
     if not user_event_rows:
         print("No user-event captures after filters.", file=sys.stderr)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        write_csv(out_dir / "jump_events.csv", event_rows)
-        write_csv(out_dir / "candidate_users.csv", [])
-        write_csv(out_dir / "user_event_scores.csv", [])
+        sqlite_upsert_scanner_results(data_dir, jump_events=event_rows, user_event_scores=[], candidate_users=[])
         update_watermark(
             data_dir,
             "analysis",
@@ -1145,12 +1053,14 @@ def main() -> None:
         reverse=True,
     )
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    write_csv(out_dir / "jump_events.csv", event_rows)
-    write_csv(out_dir / "user_event_scores.csv", user_event_rows)
-    write_csv(out_dir / "candidate_users.csv", candidates)
+    sqlite_counts = sqlite_upsert_scanner_results(
+        data_dir,
+        jump_events=event_rows,
+        user_event_scores=user_event_rows,
+        candidate_users=candidates,
+    )
 
-    seeded_created, seeded_existing = seed_user_dirs_for_candidates(
+    seeded_created, seeded_existing = count_selected_candidates(
         data_dir,
         candidates,
         accepted_confidences={"high", "very_high"},
@@ -1165,20 +1075,19 @@ def main() -> None:
             "jump_events": len(event_rows),
             "candidate_users": len(candidates),
             "user_event_scores": len(user_event_rows),
-            "seeded_user_dirs_created": seeded_created,
-            "seeded_user_dirs_existing": seeded_existing,
+            "selected_high_confidence_candidates": seeded_existing,
             "allow_api": bool(allow_api),
         },
     )
 
     print("", file=sys.stderr)
-    print(f"Jump events written: {out_dir / 'jump_events.csv'}", file=sys.stderr)
-    print(f"User-event scores written: {out_dir / 'user_event_scores.csv'}", file=sys.stderr)
-    print(f"Candidate users written: {out_dir / 'candidate_users.csv'}", file=sys.stderr)
+    print(f"Jump events written to SQLite: {sqlite_counts['jump_events']}", file=sys.stderr)
+    print(f"User-event scores written to SQLite: {sqlite_counts['user_event_scores']}", file=sys.stderr)
+    print(f"Candidate users written to SQLite: {sqlite_counts['candidate_users']}", file=sys.stderr)
     print(
         (
-            "Seeded data/user folders for high-confidence candidates: "
-            f"created={seeded_created}, already_present={seeded_existing}"
+            "High-confidence candidates available for user updates: "
+            f"{seeded_existing}"
         ),
         file=sys.stderr,
     )

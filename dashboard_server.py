@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-import csv
 import html
 import json
+import math
 import os
 import re
 import subprocess
 import sys
 import threading
 from datetime import datetime, timezone
-from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
@@ -28,13 +27,32 @@ from runtime_state import (
     read_json,
     run_state_dir,
     update_job,
+    utc_now_compact,
     utc_now_iso,
+)
+from sqlite_store import (
+    count_market_rows as sqlite_count_market_rows,
+    default_db_path,
+    load_market_statuses as sqlite_load_market_statuses,
+    load_market_raw_row as sqlite_load_market_raw_row,
+    load_market_summary_rows as sqlite_load_market_summary_rows,
+    load_scanner_candidate_rows as sqlite_load_scanner_candidate_rows,
+    load_scanner_jump_event_rows as sqlite_load_scanner_jump_event_rows,
+    load_user_metric_rows as sqlite_load_user_metric_rows,
+    load_user_alias_rows as sqlite_load_user_alias_rows,
+    load_user_profile_row as sqlite_load_user_profile_row,
+    load_user_profile_rows as sqlite_load_user_profile_rows,
+    load_user_scanner_market_signals as sqlite_load_user_scanner_market_signals,
+    load_user_trade_rows as sqlite_load_user_trade_rows,
+    list_user_keys as sqlite_list_user_keys,
+    sqlite_database_available,
 )
 from utils import parse_jsonish_list, safe_float, safe_int, to_iso_utc
 
 
 ROOT = Path(__file__).resolve().parent
 USER_LIST_CANDIDATE_CONFIDENCES = {"monitor", "candidate", "high", "very_high"}
+WALLET_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 
 
 def app_command(*parts: str) -> List[str]:
@@ -54,7 +72,6 @@ JOB_COMMANDS: Dict[str, Tuple[str, List[str]]] = {
     ),
     "analyze_luck": ("Analyze luck/skill", app_command("analyze", "luck")),
     "analyze_scanner": ("Analyze markets", app_command("analyze", "scanner")),
-    "build_dashboards": ("Build static dashboards", app_command("dashboard", "build")),
 }
 
 
@@ -135,22 +152,6 @@ def add_market_to_list(condition_id: str, *, source: str = "manual", root: Path 
     return entry
 
 
-def read_csv_rows(path: Path, limit: int = 5000) -> List[Dict[str, str]]:
-    if not path.exists():
-        return []
-    rows: List[Dict[str, str]] = []
-    try:
-        with path.open("r", newline="", encoding="utf-8-sig") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                rows.append(dict(row))
-                if len(rows) >= limit:
-                    break
-    except OSError:
-        return []
-    return rows
-
-
 def fmt_float(value: Any, digits: int = 2) -> str:
     number = safe_float(value)
     if number is None:
@@ -185,14 +186,50 @@ def candidate_signal_score(row: Dict[str, Any] | None) -> float | None:
     confidence_base = {"monitor": 45.0, "candidate": 62.0, "high": 78.0, "very_high": 92.0}.get(confidence)
     timing_z = safe_float(row.get("timing_z")) if "timing_z" in row else safe_float(row.get("candidate_timing_z"))
     events = safe_int(row.get("number_of_independent_events")) if "number_of_independent_events" in row else safe_int(row.get("candidate_events"))
-    if confidence_base is None and timing_z is None and events is None:
+    capture = (
+        safe_float(row.get("cluster_capped_total_jump_capture"))
+        if "cluster_capped_total_jump_capture" in row
+        else safe_float(row.get("candidate_jump_capture"))
+    )
+    if capture is None:
+        capture = safe_float(row.get("total_jump_capture"))
+    gross_notional = (
+        safe_float(row.get("gross_notional"))
+        if "gross_notional" in row
+        else safe_float(row.get("candidate_gross_notional"))
+    )
+    directional_ratio = (
+        safe_float(row.get("avg_directional_ratio"))
+        if "avg_directional_ratio" in row
+        else safe_float(row.get("candidate_directional_ratio"))
+    )
+    jumps_captured = (
+        safe_int(row.get("number_of_jumps_captured"))
+        if "number_of_jumps_captured" in row
+        else safe_int(row.get("candidate_jumps_captured"))
+    )
+    if confidence_base is None and timing_z is None and events is None and capture is None:
         return None
 
     z_score = clamp_score(45.0 + (timing_z or 0.0) * 9.0)
     event_score = clamp_score((events or 0) * 10.0 + 25.0)
+    capture_roi = (capture / gross_notional) if capture is not None and gross_notional and gross_notional > 0 else 0.0
+    capture_score = clamp_score(45.0 + capture_roi * 900.0)
+    direction_score = clamp_score(45.0 + (directional_ratio or 0.0) * 50.0)
+    hit_score = clamp_score(35.0 + (jumps_captured or 0) * 8.0)
     if confidence_base is None:
         confidence_base = 50.0
-    return clamp_score(max(confidence_base, 0.45 * z_score + 0.35 * event_score + 0.20 * confidence_base))
+    score = max(
+        confidence_base,
+        0.34 * z_score
+        + 0.24 * event_score
+        + 0.18 * capture_score
+        + 0.14 * direction_score
+        + 0.10 * hit_score,
+    )
+    if capture is not None and capture <= 0:
+        score = min(score, 49.0)
+    return clamp_score(score)
 
 
 def market_jump_signal_score(move: Any, participants: Any = None) -> float:
@@ -206,27 +243,81 @@ def metric_signal_score(row: Dict[str, Any]) -> float | None:
     skill_z = safe_float(row.get("skill_z"))
     luck_index = safe_float(row.get("luck_index"))
     raw_pnl = safe_float(row.get("raw_pnl_usdc"))
+    skill_usdc = safe_float(row.get("skill_usdc"))
+    skill_roi = safe_float(row.get("skill_roi"))
     gross_notional = safe_float(row.get("gross_trade_notional_usdc"))
     resolved = safe_int(row.get("resolved_markets") or row.get("number_of_resolved_markets")) or 0
     trades = safe_int(row.get("total_trades")) or 0
+    profitable_market_ratio = safe_float(row.get("profitable_market_ratio"))
+    edge_per_trade = monetized_edge_per_trade(row)
 
-    if skill_index is None and skill_z is None and luck_index is None and raw_pnl is None:
+    if skill_index is None and skill_z is None and luck_index is None and raw_pnl is None and skill_usdc is None:
         return None
 
     skill_percentile = skill_index if skill_index is not None else clamp_score(50.0 + (skill_z or 0.0) * 16.0)
     skill_z_score = clamp_score(50.0 + (skill_z or 0.0) * 16.0)
-    luck_outlier = luck_index if luck_index is not None else 50.0
     roi = (raw_pnl / gross_notional) if raw_pnl is not None and gross_notional and gross_notional > 0 else 0.0
-    profit_score = clamp_score(50.0 + roi * 350.0)
-    sample_score = clamp_score(min(resolved, 40) * 1.6 + min(trades, 5000) / 5000 * 36.0)
-
-    return clamp_score(
-        0.38 * skill_percentile
-        + 0.20 * skill_z_score
-        + 0.15 * luck_outlier
-        + 0.15 * profit_score
-        + 0.12 * sample_score
+    profit_roi_score = clamp_score(50.0 + roi * 700.0)
+    skill_roi_score = clamp_score(50.0 + (skill_roi or 0.0) * 900.0)
+    pnl_sign_score = 88.0 if raw_pnl is not None and raw_pnl > 0 else 25.0 if raw_pnl is not None and raw_pnl < 0 else 45.0
+    profit_consistency_score = (
+        clamp_score(profitable_market_ratio * 100.0)
+        if profitable_market_ratio is not None
+        else 50.0
     )
+    if edge_per_trade is None:
+        edge_per_trade_score = 50.0
+    elif edge_per_trade <= 0:
+        edge_per_trade_score = 25.0
+    else:
+        edge_per_trade_score = clamp_score(45.0 + math.log1p(edge_per_trade) * 12.0)
+    sample_score = clamp_score(min(resolved, 25) * 2.4 + min(trades, 2000) / 2000 * 40.0)
+
+    score = (
+        0.22 * profit_roi_score
+        + 0.18 * pnl_sign_score
+        + 0.20 * skill_percentile
+        + 0.12 * skill_z_score
+        + 0.10 * skill_roi_score
+        + 0.08 * profit_consistency_score
+        + 0.10 * edge_per_trade_score
+    )
+    sample_multiplier = 0.80 + 0.20 * (sample_score / 100.0)
+    score *= sample_multiplier
+
+    if raw_pnl is not None and raw_pnl <= 0 and (skill_usdc is None or skill_usdc <= 0):
+        score = min(score, 39.0)
+    elif raw_pnl is not None and raw_pnl <= 0:
+        score = min(score, 52.0)
+    elif skill_usdc is not None and skill_usdc <= 0:
+        score = min(score, 68.0)
+
+    return clamp_score(score)
+
+
+def per_trade_value(total: float | None, trades: int | None) -> float | None:
+    if total is None or trades is None or trades <= 0:
+        return None
+    return total / trades
+
+
+def monetized_edge_per_trade(row: Dict[str, Any]) -> float | None:
+    explicit = safe_float(row.get("monetized_edge_per_trade_usdc"))
+    if explicit is not None:
+        return explicit
+
+    trades = safe_int(row.get("total_trades"))
+    pnl_per_trade = safe_float(row.get("pnl_per_trade_usdc"))
+    if pnl_per_trade is None:
+        pnl_per_trade = per_trade_value(safe_float(row.get("raw_pnl_usdc")), trades)
+
+    skill_per_trade = safe_float(row.get("skill_per_trade_usdc"))
+    if skill_per_trade is None:
+        skill_per_trade = per_trade_value(safe_float(row.get("skill_usdc")), trades)
+
+    if pnl_per_trade is not None and skill_per_trade is not None:
+        return min(pnl_per_trade, skill_per_trade)
+    return pnl_per_trade if pnl_per_trade is not None else skill_per_trade
 
 
 def evidence_summary(row: Dict[str, Any]) -> str:
@@ -234,12 +325,18 @@ def evidence_summary(row: Dict[str, Any]) -> str:
     confidence = str(row.get("candidate_confidence") or "").strip()
     timing_z = safe_float(row.get("candidate_timing_z"))
     candidate_events = safe_int(row.get("candidate_events"))
+    jump_capture = safe_float(row.get("candidate_jump_capture"))
+    jump_notional = safe_float(row.get("candidate_gross_notional"))
     if confidence:
         scanner = f"{confidence} timing"
         if timing_z is not None:
             scanner += f" z={timing_z:.2f}"
         if candidate_events is not None:
             scanner += f" across {candidate_events} events"
+        if jump_capture is not None:
+            scanner += f", jump capture ${jump_capture:,.0f}"
+            if jump_notional:
+                scanner += f" ({jump_capture / jump_notional:.1%})"
         parts.append(scanner)
 
     skill_index = safe_float(row.get("skill_index"))
@@ -254,8 +351,24 @@ def evidence_summary(row: Dict[str, Any]) -> str:
         parts.append(skill)
 
     pnl = safe_float(row.get("raw_pnl_usdc"))
+    gross_notional = safe_float(row.get("gross_trade_notional_usdc"))
     if pnl is not None:
-        parts.append(f"PnL ${pnl:,.0f}")
+        pnl_text = f"PnL ${pnl:,.0f}"
+        if gross_notional:
+            pnl_text += f" ({pnl / gross_notional:.1%})"
+        parts.append(pnl_text)
+
+    skill_usdc = safe_float(row.get("skill_usdc"))
+    if skill_usdc is not None:
+        parts.append(f"expected edge ${skill_usdc:,.0f}")
+
+    edge_per_trade = safe_float(row.get("monetized_edge_per_trade_usdc"))
+    if edge_per_trade is not None:
+        parts.append(f"info edge ${edge_per_trade:,.2f}/trade")
+
+    cap_reason = str(row.get("score_cap_reason") or "").strip()
+    if cap_reason:
+        parts.append(cap_reason)
 
     return "; ".join(parts) if parts else "Needs user update"
 
@@ -263,17 +376,38 @@ def evidence_summary(row: Dict[str, Any]) -> str:
 def apply_information_edge_score(row: Dict[str, Any], candidate: Dict[str, Any] | None = None) -> Dict[str, Any]:
     cand_score = candidate_signal_score(candidate or row)
     metric_score = metric_signal_score(row)
+    has_metrics = bool(row.get("has_metrics"))
+    raw_pnl = safe_float(row.get("raw_pnl_usdc"))
+    skill_usdc = safe_float(row.get("skill_usdc"))
+
     if cand_score is not None and metric_score is not None:
-        score = max(cand_score, 0.62 * cand_score + 0.38 * metric_score)
+        score = 0.45 * min(cand_score, metric_score) + 0.35 * cand_score + 0.20 * metric_score
     elif cand_score is not None:
-        score = cand_score
+        score = min(cand_score, 62.0)
     elif metric_score is not None:
-        score = metric_score
+        score = min(metric_score, 74.0)
     else:
         score = None
 
+    cap_reason = ""
+    if score is not None and cand_score is not None and not has_metrics:
+        score = min(score, 62.0)
+        cap_reason = "needs user update for realized profit"
+    if score is not None and raw_pnl is not None and raw_pnl <= 0:
+        if skill_usdc is not None and skill_usdc > 0:
+            score = min(score, 70.0)
+            cap_reason = "negative realized PnL caps insider score"
+        else:
+            score = min(score, 54.0)
+            cap_reason = "loss-making profile caps insider score"
+    if score is not None and raw_pnl is not None and raw_pnl > 0 and skill_usdc is not None and skill_usdc <= 0:
+        score = min(score, 78.0)
+        cap_reason = "profit lacks positive expected edge"
+
     row["scanner_signal_score"] = cand_score
     row["metric_signal_score"] = metric_score
+    row["profit_signal_score"] = metric_score
+    row["score_cap_reason"] = cap_reason
     row["info_edge_score"] = round(score, 1) if score is not None else None
     row["info_edge_tier"] = score_tier(score)
     row["evidence_summary"] = evidence_summary(row)
@@ -287,23 +421,97 @@ def row_matches(row: Dict[str, Any], query: str) -> bool:
     return any(needle in str(value).lower() for value in row.values())
 
 
-def load_user_analysis(data_dir: str, reports_dir: str, query: str = "", limit: int = 200) -> Dict[str, Any]:
-    reports = Path(reports_dir)
-    metrics_path = reports / "luck_skill" / "metrics_all_users.csv"
-    metric_rows = read_csv_rows(metrics_path, limit=10_000)
-    if not metric_rows:
-        users_dir = reports / "luck_skill" / "users"
-        if users_dir.exists():
-            for metrics_file in sorted(users_dir.glob("*/metrics.csv")):
-                metric_rows.extend(read_csv_rows(metrics_file, limit=1))
+def is_wallet(value: Any) -> bool:
+    return bool(WALLET_RE.match(str(value or "").strip()))
+
+
+def apply_alias_to_profile(profile: Dict[str, Any], alias: Dict[str, Any], user_key: str) -> None:
+    if not alias:
+        return
+    alias_value = str(alias.get("alias") or "").strip()
+    display_value = str(alias.get("display_name") or alias_value or "").strip()
+    fallback_text = str(user_key or "").strip().lower()
+
+    current_input = str(profile.get("input_user") or "").strip()
+    if alias_value and (not current_input or current_input.lower() == fallback_text or is_wallet(current_input)):
+        profile["input_user"] = alias_value
+
+    if not display_value or is_wallet(display_value):
+        return
+    for key in ("display_name", "name"):
+        current = str(profile.get(key) or "").strip()
+        if not current or current.lower() == fallback_text or is_wallet(current):
+            profile[key] = display_value
+
+
+def profile_display_name(profile: Dict[str, Any], fallback: str) -> str:
+    fallback_text = str(fallback or "").strip().lower()
+    for key in ("display_name", "name", "pseudonym", "profile_name", "profile_pseudonym", "input_user", "referral"):
+        value = str(profile.get(key) or "").strip()
+        if value and value.lower() != fallback_text and not is_wallet(value):
+            return value
+    return fallback
+
+
+def load_user_analysis(
+    data_dir: str,
+    reports_dir: str,
+    query: str = "",
+    limit: int = 200,
+    candidate_only: bool = False,
+) -> Dict[str, Any]:
+    db_path = default_db_path(data_dir)
+    if not sqlite_database_available(data_dir):
+        return {
+            "count": 0,
+            "total_count": 0,
+            "database_user_count": 0,
+            "candidate_count": 0,
+            "candidate_only_count": 0,
+            "shown_candidate_count": 0,
+            "candidate_filter_active": bool(candidate_only),
+            "high_signal_count": 0,
+            "rows": [],
+            "top_info_edge": [],
+            "top_luck": [],
+            "top_skill": [],
+            "top_pnl": [],
+            "source": "database",
+            "error": "database unavailable",
+        }
+
+    metric_rows = sqlite_load_user_metric_rows(db_path)
+    user_profiles = sqlite_load_user_profile_rows(data_dir, db_path=db_path)
+    user_aliases = sqlite_load_user_alias_rows(data_dir, db_path=db_path)
+    aliases_by_user: Dict[str, Dict[str, Any]] = {}
+
+    def alias_score(alias_row: Dict[str, Any]) -> Tuple[int, str]:
+        alias_value = str(alias_row.get("alias") or "").strip()
+        display_value = str(alias_row.get("display_name") or "").strip()
+        user_key = str(alias_row.get("user_key") or "").strip()
+        score = 0
+        if alias_value and not is_wallet(alias_value):
+            score += 2
+        if display_value and display_value.lower() != user_key.lower() and not is_wallet(display_value):
+            score += 3
+        if str(alias_row.get("source") or "").lower() in {"manual", "polymarket_profile", "user_update"}:
+            score += 1
+        return score, str(alias_row.get("updated_at") or "")
+
+    for alias_row in user_aliases.values():
+        key = str(alias_row.get("user_key") or "")
+        if not key:
+            continue
+        existing_alias = aliases_by_user.get(key)
+        if not existing_alias or alias_score(alias_row) > alias_score(existing_alias):
+            aliases_by_user[key] = alias_row
 
     total_count = len(metric_rows)
-    scanner_candidates = read_csv_rows(reports / "market_scanner" / "candidate_users.csv", limit=100_000)
-    users_root = Path(data_dir) / "user"
     try:
-        cached_user_count = sum(1 for path in users_root.iterdir() if path.is_dir()) if users_root.exists() else 0
-    except OSError:
-        cached_user_count = 0
+        database_user_count = len(sqlite_list_user_keys(data_dir, include_candidates=False, db_path=db_path))
+    except Exception:
+        database_user_count = total_count
+    scanner_candidates = sqlite_load_scanner_candidate_rows(db_path)
     watermarks = load_watermarks(data_dir)
     user_watermarks = watermarks.get("users", {}) if isinstance(watermarks.get("users"), dict) else {}
     analysis_user_watermarks = (
@@ -318,10 +526,19 @@ def load_user_analysis(data_dir: str, reports_dir: str, query: str = "", limit: 
             if isinstance(analysis_user_watermarks.get(user_key), dict)
             else {}
         )
-        metrics_mtime = file_mtime_iso(reports / "luck_skill" / "users" / user_key / "metrics.csv")
+        metrics_mtime = str(row.get("_db_updated_at") or "")
+        profile = dict(user_profiles.get(user_key, {}))
+        alias = aliases_by_user.get(user_key, {})
+        apply_alias_to_profile(profile, alias, user_key)
+        display_name = profile_display_name(profile, user_key)
         return {
             "user_key": user_key,
+            "display_name": display_name,
+            "profile_name": str(profile.get("name") or profile.get("profile_name") or ""),
+            "profile_pseudonym": str(profile.get("pseudonym") or profile.get("profile_pseudonym") or ""),
+            "input_user": str(profile.get("input_user") or ""),
             "total_trades": safe_int(row.get("total_trades")),
+            "resolved_trade_count": safe_int(row.get("resolved_trade_count")),
             "luck_index": safe_float(row.get("luck_index")),
             "luck_z": safe_float(row.get("luck_z")),
             "skill_index": safe_float(row.get("skill_index")),
@@ -329,9 +546,19 @@ def load_user_analysis(data_dir: str, reports_dir: str, query: str = "", limit: 
             "raw_pnl_usdc": safe_float(row.get("raw_pnl_usdc")),
             "skill_usdc": safe_float(row.get("skill_usdc")),
             "skill_roi": safe_float(row.get("skill_roi")),
+            "pnl_per_trade_usdc": safe_float(row.get("pnl_per_trade_usdc")),
+            "pnl_per_resolved_trade_usdc": safe_float(row.get("pnl_per_resolved_trade_usdc")),
+            "skill_per_trade_usdc": safe_float(row.get("skill_per_trade_usdc")),
+            "skill_per_resolved_trade_usdc": safe_float(row.get("skill_per_resolved_trade_usdc")),
+            "monetized_edge_per_trade_usdc": safe_float(row.get("monetized_edge_per_trade_usdc")),
             "gross_trade_notional_usdc": safe_float(row.get("gross_trade_notional_usdc")),
             "total_luck_usdc": safe_float(row.get("total_luck_usdc")),
             "resolved_markets": safe_int(row.get("number_of_resolved_markets")),
+            "profitable_resolved_markets": safe_int(row.get("profitable_resolved_markets")),
+            "losing_resolved_markets": safe_int(row.get("losing_resolved_markets")),
+            "profitable_market_ratio": safe_float(row.get("profitable_market_ratio")),
+            "largest_market_profit_usdc": safe_float(row.get("largest_market_profit_usdc")),
+            "largest_market_loss_usdc": safe_float(row.get("largest_market_loss_usdc")),
             "warning_count": safe_int(row.get("warning_count")),
             "last_updated_at": str(analysis_freshness.get("updated_at") or metrics_mtime or freshness.get("updated_at") or ""),
             "data_updated_at": str(freshness.get("updated_at") or ""),
@@ -344,7 +571,25 @@ def load_user_analysis(data_dir: str, reports_dir: str, query: str = "", limit: 
             "candidate_confidence": "",
             "candidate_timing_z": None,
             "candidate_events": None,
+            "candidate_jumps_captured": None,
+            "candidate_jump_capture": None,
+            "candidate_gross_notional": None,
+            "candidate_directional_ratio": None,
         }
+
+    def apply_candidate_fields(row: Dict[str, Any], candidate: Dict[str, Any]) -> Dict[str, Any]:
+        confidence = str(candidate.get("confidence_level") or "").strip().lower()
+        row["source_label"] = f"Analyzed + {confidence}" if row.get("has_metrics") and confidence else row.get("source_label")
+        row["candidate_confidence"] = confidence
+        row["candidate_timing_z"] = safe_float(candidate.get("timing_z"))
+        row["candidate_events"] = safe_int(candidate.get("number_of_independent_events"))
+        row["candidate_jumps_captured"] = safe_int(candidate.get("number_of_jumps_captured"))
+        row["candidate_jump_capture"] = safe_float(
+            candidate.get("cluster_capped_total_jump_capture") or candidate.get("total_jump_capture")
+        )
+        row["candidate_gross_notional"] = safe_float(candidate.get("gross_notional"))
+        row["candidate_directional_ratio"] = safe_float(candidate.get("avg_directional_ratio"))
+        return row
 
     def confidence_rank(row: Dict[str, Any]) -> Tuple[int, float]:
         ranks = {"very_high": 4, "high": 3, "candidate": 2, "monitor": 1}
@@ -370,18 +615,23 @@ def load_user_analysis(data_dir: str, reports_dir: str, query: str = "", limit: 
         candidate = candidate_by_user.get(str(row.get("user_key") or ""))
         if not candidate:
             continue
-        confidence = str(candidate.get("confidence_level") or "").strip().lower()
-        row["source_label"] = f"Analyzed + {confidence}" if confidence else "Analyzed + candidate"
-        row["candidate_confidence"] = confidence
-        row["candidate_timing_z"] = safe_float(candidate.get("timing_z"))
-        row["candidate_events"] = safe_int(candidate.get("number_of_independent_events"))
+        apply_candidate_fields(row, candidate)
 
     def compact_candidate(user_key: str, row: Dict[str, Any]) -> Dict[str, Any]:
         freshness = user_watermarks.get(user_key, {}) if isinstance(user_watermarks.get(user_key), dict) else {}
         confidence = str(row.get("confidence_level") or "").strip().lower()
+        profile = dict(user_profiles.get(user_key, {}))
+        alias = aliases_by_user.get(user_key, {})
+        apply_alias_to_profile(profile, alias, user_key)
+        display_name = profile_display_name(profile, user_key)
         return {
             "user_key": user_key,
+            "display_name": display_name,
+            "profile_name": str(profile.get("name") or profile.get("profile_name") or ""),
+            "profile_pseudonym": str(profile.get("pseudonym") or profile.get("profile_pseudonym") or ""),
+            "input_user": str(profile.get("input_user") or ""),
             "total_trades": None,
+            "resolved_trade_count": None,
             "luck_index": None,
             "luck_z": None,
             "skill_index": None,
@@ -389,9 +639,19 @@ def load_user_analysis(data_dir: str, reports_dir: str, query: str = "", limit: 
             "raw_pnl_usdc": None,
             "skill_usdc": None,
             "skill_roi": None,
+            "pnl_per_trade_usdc": None,
+            "pnl_per_resolved_trade_usdc": None,
+            "skill_per_trade_usdc": None,
+            "skill_per_resolved_trade_usdc": None,
+            "monetized_edge_per_trade_usdc": None,
             "gross_trade_notional_usdc": None,
             "total_luck_usdc": None,
             "resolved_markets": None,
+            "profitable_resolved_markets": None,
+            "losing_resolved_markets": None,
+            "profitable_market_ratio": None,
+            "largest_market_profit_usdc": None,
+            "largest_market_loss_usdc": None,
             "warning_count": None,
             "last_updated_at": "",
             "data_updated_at": str(freshness.get("updated_at") or ""),
@@ -404,6 +664,10 @@ def load_user_analysis(data_dir: str, reports_dir: str, query: str = "", limit: 
             "candidate_confidence": confidence,
             "candidate_timing_z": safe_float(row.get("timing_z")),
             "candidate_events": safe_int(row.get("number_of_independent_events")),
+            "candidate_jumps_captured": safe_int(row.get("number_of_jumps_captured")),
+            "candidate_jump_capture": safe_float(row.get("cluster_capped_total_jump_capture") or row.get("total_jump_capture")),
+            "candidate_gross_notional": safe_float(row.get("gross_notional")),
+            "candidate_directional_ratio": safe_float(row.get("avg_directional_ratio")),
         }
 
     candidate_only_rows = [
@@ -411,6 +675,65 @@ def load_user_analysis(data_dir: str, reports_dir: str, query: str = "", limit: 
         for user_key, row in candidate_by_user.items()
         if user_key not in metric_user_keys
     ]
+
+    profile_only_rows = []
+    profile_user_keys = set(user_profiles.keys()) | set(aliases_by_user.keys())
+    for user_key in profile_user_keys:
+        profile = dict(user_profiles.get(user_key, {}))
+        alias = aliases_by_user.get(user_key, {})
+        apply_alias_to_profile(profile, alias, user_key)
+        if user_key in metric_user_keys or user_key in candidate_by_user:
+            continue
+        freshness = user_watermarks.get(user_key, {}) if isinstance(user_watermarks.get(user_key), dict) else {}
+        display_name = profile_display_name(profile, user_key)
+        profile_only_rows.append(
+            {
+                "user_key": user_key,
+                "display_name": display_name,
+                "profile_name": str(profile.get("name") or profile.get("profile_name") or ""),
+                "profile_pseudonym": str(profile.get("pseudonym") or profile.get("profile_pseudonym") or ""),
+                "input_user": str(profile.get("input_user") or ""),
+                "total_trades": None,
+                "resolved_trade_count": None,
+                "luck_index": None,
+                "luck_z": None,
+                "skill_index": None,
+                "skill_z": None,
+                "raw_pnl_usdc": None,
+                "skill_usdc": None,
+                "skill_roi": None,
+                "pnl_per_trade_usdc": None,
+                "pnl_per_resolved_trade_usdc": None,
+                "skill_per_trade_usdc": None,
+                "skill_per_resolved_trade_usdc": None,
+                "monetized_edge_per_trade_usdc": None,
+                "gross_trade_notional_usdc": None,
+                "total_luck_usdc": None,
+                "resolved_markets": None,
+                "profitable_resolved_markets": None,
+                "losing_resolved_markets": None,
+                "profitable_market_ratio": None,
+                "largest_market_profit_usdc": None,
+                "largest_market_loss_usdc": None,
+                "warning_count": None,
+                "last_updated_at": str(freshness.get("updated_at") or profile.get("_db_updated_at") or ""),
+                "data_updated_at": str(freshness.get("updated_at") or ""),
+                "analysis_updated_at": "",
+                "last_seen_trade_utc": str(freshness.get("last_seen_trade_utc") or ""),
+                "new_trades_written": safe_int(freshness.get("new_trades_written")),
+                "source": "profile",
+                "source_label": "Needs update",
+                "has_metrics": False,
+                "candidate_confidence": "",
+                "candidate_timing_z": None,
+                "candidate_events": None,
+                "candidate_jumps_captured": None,
+                "candidate_jump_capture": None,
+                "candidate_gross_notional": None,
+                "candidate_directional_ratio": None,
+            }
+        )
+
     def compacted_candidate_rank(row: Dict[str, Any]) -> Tuple[int, float]:
         ranks = {"very_high": 4, "high": 3, "candidate": 2, "monitor": 1}
         confidence = str(row.get("candidate_confidence") or "").strip().lower()
@@ -420,40 +743,73 @@ def load_user_analysis(data_dir: str, reports_dir: str, query: str = "", limit: 
 
     for row in compacted_metric_rows:
         apply_information_edge_score(row, candidate_by_user.get(str(row.get("user_key") or "")))
+        row["monetized_edge_per_trade_usdc"] = monetized_edge_per_trade(row)
+        row["evidence_summary"] = evidence_summary(row)
     for row in candidate_only_rows:
         apply_information_edge_score(row)
+        row["monetized_edge_per_trade_usdc"] = monetized_edge_per_trade(row)
+        row["evidence_summary"] = evidence_summary(row)
+    for row in profile_only_rows:
+        apply_information_edge_score(row)
+        row["info_edge_tier"] = "Needs update"
+        row["monetized_edge_per_trade_usdc"] = monetized_edge_per_trade(row)
+        row["evidence_summary"] = "Alias/profile exists in SQLite, but trade and analysis rows are missing. Update this user to fetch trades and rerun analysis."
 
-    combined_rows = compacted_metric_rows + candidate_only_rows
-    visible_rows = [row for row in combined_rows if row_matches(row, query)]
-    visible_metric_rows = [row for row in compacted_metric_rows if row_matches(row, query)]
-    visible_candidate_rows = [row for row in candidate_only_rows if row_matches(row, query)]
+    combined_rows = compacted_metric_rows + candidate_only_rows + profile_only_rows
+    candidate_rows_all = [row for row in combined_rows if row.get("candidate_confidence")]
+    rows_for_filter = candidate_rows_all if candidate_only else combined_rows
+    visible_rows = [row for row in rows_for_filter if row_matches(row, query)]
+    visible_metric_rows = [
+        row
+        for row in compacted_metric_rows
+        if row_matches(row, query) and (not candidate_only or row.get("candidate_confidence"))
+    ]
+    visible_candidate_rows = [row for row in candidate_rows_all if row_matches(row, query)]
     top_luck = sort_by_float(visible_metric_rows, "luck_index")[:limit]
     top_skill = sort_by_float(visible_metric_rows, "skill_index")[:limit]
     top_pnl = sort_by_float(visible_metric_rows, "raw_pnl_usdc")[:limit]
     top_info_edge = sort_by_float(visible_rows, "info_edge_score")[:limit]
-    rows_for_table = top_info_edge
+    rows_for_table = list(top_info_edge)
+    if not candidate_only:
+        shown_keys = {str(row.get("user_key") or "") for row in rows_for_table}
+        for row in profile_only_rows:
+            user_key = str(row.get("user_key") or "")
+            if user_key and user_key not in shown_keys and row_matches(row, query):
+                rows_for_table.append(row)
+                shown_keys.add(user_key)
 
     return {
         "count": len(visible_rows),
         "total_count": total_count,
-        "cached_user_count": cached_user_count,
+        "database_user_count": database_user_count,
         "candidate_count": len(candidate_by_user),
         "candidate_only_count": len(candidate_only_rows),
         "shown_candidate_count": len(visible_candidate_rows),
+        "candidate_filter_active": bool(candidate_only),
         "high_signal_count": sum(1 for row in combined_rows if (safe_float(row.get("info_edge_score")) or 0.0) >= 70.0),
         "rows": rows_for_table,
         "top_info_edge": top_info_edge,
         "top_luck": top_luck,
         "top_skill": top_skill,
         "top_pnl": top_pnl,
-        "metrics_path": str(metrics_path),
+        "source": "database",
     }
 
 
-def load_scanner(reports_dir: str, query: str = "", limit: int = 200) -> Dict[str, Any]:
-    scanner_dir = Path(reports_dir) / "market_scanner"
-    candidate_rows = read_csv_rows(scanner_dir / "candidate_users.csv", limit=100_000)
-    event_rows = read_csv_rows(scanner_dir / "jump_events.csv", limit=100_000)
+def load_scanner(reports_dir: str, query: str = "", limit: int = 200, data_dir: str = "data") -> Dict[str, Any]:
+    db_path = default_db_path(data_dir)
+    if not sqlite_database_available(data_dir):
+        return {
+            "candidate_count": 0,
+            "event_count": 0,
+            "confidence_counts": {},
+            "candidates": [],
+            "events": [],
+            "source": "database",
+            "error": "database unavailable",
+        }
+    candidate_rows = sqlite_load_scanner_candidate_rows(db_path)
+    event_rows = sqlite_load_scanner_jump_event_rows(db_path)
 
     candidate_rows = [row for row in candidate_rows if row_matches(row, query)]
     event_rows = [row for row in event_rows if row_matches(row, query)]
@@ -511,7 +867,7 @@ def load_scanner(reports_dir: str, query: str = "", limit: int = 200) -> Dict[st
         "confidence_counts": confidence_counts,
         "candidates": candidates,
         "events": events,
-        "scanner_dir": str(scanner_dir),
+        "source": "database",
     }
 
 
@@ -520,10 +876,56 @@ def safe_user_key(value: str) -> str:
     return "".join(ch for ch in text if ch.isalnum() or ch in "._-")
 
 
+def clean_user_identifier(value: Any) -> str:
+    text = str(value or "").strip().lstrip("@").lower()
+    return safe_user_key(text)
+
+
+def scanner_candidate_user_keys(
+    reports_dir: str,
+    *,
+    confidences: Iterable[str] = USER_LIST_CANDIDATE_CONFIDENCES,
+    data_dir: str = "data",
+) -> List[str]:
+    accepted = {str(confidence).strip().lower() for confidence in confidences if str(confidence).strip()}
+    ranks = {"very_high": 4, "high": 3, "candidate": 2, "monitor": 1}
+    best_by_user: Dict[str, Dict[str, Any]] = {}
+
+    if not sqlite_database_available(data_dir):
+        return []
+    rows = sqlite_load_scanner_candidate_rows(default_db_path(data_dir))
+    for row in rows:
+        confidence = str(row.get("confidence_level") or "").strip().lower()
+        if confidence not in accepted:
+            continue
+        user_key = safe_user_key(str(row.get("wallet") or "").lower())
+        if not user_key:
+            continue
+        current = best_by_user.get(user_key)
+        row_rank = (ranks.get(confidence, 0), safe_float(row.get("timing_z")) or float("-inf"))
+        current_rank = (
+            ranks.get(str((current or {}).get("confidence_level") or "").strip().lower(), 0),
+            safe_float((current or {}).get("timing_z")) or float("-inf"),
+        )
+        if current is None or row_rank > current_rank:
+            best_by_user[user_key] = row
+
+    return [
+        user_key
+        for user_key, row in sorted(
+            best_by_user.items(),
+            key=lambda item: (
+                ranks.get(str(item[1].get("confidence_level") or "").strip().lower(), 0),
+                safe_float(item[1].get("timing_z")) or float("-inf"),
+                item[0],
+            ),
+            reverse=True,
+        )
+    ]
+
+
 def load_user_profile(data_dir: str, user_key: str) -> Dict[str, Any]:
-    profile_path = Path(data_dir) / "user" / user_key / "profile.csv"
-    rows = read_csv_rows(profile_path, limit=1)
-    return dict(rows[0]) if rows else {}
+    return sqlite_load_user_profile_row(data_dir, user_key) if sqlite_database_available(data_dir) else {}
 
 
 def truthy(value: Any) -> bool:
@@ -562,193 +964,33 @@ def market_status_from_row(row: Dict[str, Any]) -> Dict[str, str]:
     return {"market_status": "unknown", "market_status_label": "Unknown"}
 
 
-def load_market_statuses(data_dir: str, condition_ids: Iterable[str]) -> Dict[str, Dict[str, Any]]:
-    markets_root = Path(data_dir) / "market" / "markets"
-    statuses: Dict[str, Dict[str, str]] = {}
-    if not markets_root.exists():
-        return statuses
-
-    for raw_condition_id in sorted({str(cid or "").strip().lower() for cid in condition_ids if str(cid or "").strip()}):
-        market_files = sorted(markets_root.glob(f"*/market_{raw_condition_id}.csv"), reverse=True)
-        if not market_files:
-            continue
-        rows = read_csv_rows(market_files[0], limit=1)
-        if not rows:
-            continue
-        row = rows[0]
-        status = market_status_from_row(row)
-        status["market_end_date"] = str(row.get("endDate") or "")
-        status["market_active"] = str(row.get("active") or "")
-        status["market_closed"] = str(row.get("closed") or "")
-        status["market_title"] = str(row.get("question") or row.get("title") or row.get("slug") or "")
-        status["market_slug"] = str(row.get("slug") or "")
-        status["market_winner"] = str(row.get("winner") or "")
-        status["market_winning_outcome_index"] = str(row.get("winningOutcomeIndex") or "")
-        status["market_outcomes"] = parse_jsonish_list(row.get("outcomes"))
-        status["market_outcome_prices"] = parse_jsonish_list(row.get("outcomePrices"))
-        statuses[raw_condition_id] = status
-    return statuses
-
-
-def latest_market_cache_file(data_dir: str, condition_id: str) -> Path | None:
-    normalized = normalize_condition_id(condition_id)
-    if not normalized:
-        return None
-    markets_root = Path(data_dir) / "market" / "markets"
-    if not markets_root.exists():
-        return None
-    files = list(markets_root.glob(f"*/market_{normalized}.csv"))
-    if not files:
-        return None
-    try:
-        return max(files, key=lambda path: path.stat().st_mtime)
-    except OSError:
-        return files[0]
-
-
-def file_mtime_iso(path: Path | None) -> str:
-    if path is None:
-        return ""
-    try:
-        return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()
-    except OSError:
-        return ""
-
-
-def market_trade_cache_summary(data_dir: str, condition_id: str) -> Dict[str, str]:
-    normalized = normalize_condition_id(condition_id)
-    if not normalized:
-        return {}
-
-    trade_path = Path(data_dir) / "market" / "trades" / normalized / "trades.csv"
-    rows = read_csv_rows(trade_path, limit=1)
-    if not rows:
-        return {}
-
-    row = rows[0]
-    return {
-        "title": row.get("title") or row.get("market_title") or "",
-        "slug": row.get("slug") or "",
-        "event_slug": row.get("eventSlug") or row.get("event_slug") or "",
-    }
-
-
-EVENT_LINK_STOP_WORDS = {
-    "a",
-    "an",
-    "and",
-    "are",
-    "be",
-    "by",
-    "for",
-    "if",
-    "in",
-    "is",
-    "it",
-    "of",
-    "on",
-    "or",
-    "the",
-    "to",
-    "will",
-    "win",
-}
-
-
-def event_link_tokens(*values: Any) -> set[str]:
-    text = " ".join(str(value or "") for value in values).lower()
-    tokens = re.findall(r"[a-z0-9]+", text)
-    return {
-        token
-        for token in tokens
-        if len(token) > 1
-        and token not in EVENT_LINK_STOP_WORDS
-        and (not token.isdigit() or len(token) == 4)
-    }
-
-
-@lru_cache(maxsize=16)
-def related_event_slug_candidates(data_dir: str) -> Tuple[Tuple[str, str, str, frozenset[str]], ...]:
-    trades_root = Path(data_dir) / "market" / "trades"
-    if not trades_root.exists():
-        return ()
-
-    candidates: List[Tuple[str, str, str, frozenset[str]]] = []
-    for trade_path in trades_root.glob("*/trades.csv"):
-        rows = read_csv_rows(trade_path, limit=1)
-        if not rows:
-            continue
-        row = rows[0]
-        event_slug = str(row.get("eventSlug") or row.get("event_slug") or "").strip()
-        slug = str(row.get("slug") or "").strip()
-        title = str(row.get("title") or row.get("market_title") or "").strip()
-        if not event_slug or not (slug or title):
-            continue
-        candidates.append((event_slug, slug, title, frozenset(event_link_tokens(slug, title))))
-    return tuple(candidates)
-
-
-def infer_related_event_slug(data_dir: str, title: str, slug: str) -> str:
-    """Recover missing parent event slugs from related cached trade rows."""
-    slug_key = str(slug or "").strip().lower()
-    target_tokens = event_link_tokens(title, slug)
-    if not slug_key and not target_tokens:
-        return ""
-
-    best_by_event: Dict[str, Tuple[int, float, float]] = {}
-    for event_slug, candidate_slug, _candidate_title, candidate_tokens in related_event_slug_candidates(data_dir):
-        if slug_key and slug_key == candidate_slug.lower():
-            return event_slug
-        if not target_tokens or not candidate_tokens:
-            continue
-        shared = target_tokens & candidate_tokens
-        if len(shared) < 4:
-            continue
-        union_size = len(target_tokens | candidate_tokens)
-        jaccard = len(shared) / union_size if union_size else 0.0
-        coverage = min(len(shared) / len(target_tokens), len(shared) / len(candidate_tokens))
-        if jaccard < 0.30 or coverage < 0.45:
-            continue
-        score = (len(shared), jaccard, coverage)
-        if score > best_by_event.get(event_slug, (0, 0.0, 0.0)):
-            best_by_event[event_slug] = score
-
-    ranked = sorted(best_by_event.items(), key=lambda item: item[1], reverse=True)
-    if not ranked:
-        return ""
-    if len(ranked) > 1 and ranked[0][1] == ranked[1][1]:
-        return ""
-    return ranked[0][0]
-
-
-def market_summary_from_cache(
+def market_summary_from_database(
     data_dir: str,
     condition_id: str,
     *,
     listed: bool = False,
     added_at: str = "",
-    source: str = "cache",
+    source: str = "database",
+    db_row: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     normalized = normalize_condition_id(condition_id)
-    cache_path = latest_market_cache_file(data_dir, normalized)
-    row = read_csv_rows(cache_path, limit=1)[0] if cache_path else {}
-    trade_summary = market_trade_cache_summary(data_dir, normalized)
+    if db_row is not None:
+        db_row = dict(db_row)
+    elif sqlite_database_available(data_dir):
+        db_row = sqlite_load_market_raw_row(data_dir, normalized)
+    else:
+        db_row = {}
+    row = db_row or {}
     status = market_status_from_row(row) if row else {"market_status": "unknown", "market_status_label": "Unknown"}
     title = (
         row.get("question")
         or row.get("title")
-        or trade_summary.get("title")
         or row.get("slug")
-        or trade_summary.get("slug")
         or normalized
         or str(condition_id or "")
     )
-    slug = row.get("slug") or trade_summary.get("slug") or ""
-    event_slug = (
-        row.get("eventSlug")
-        or trade_summary.get("event_slug")
-        or infer_related_event_slug(data_dir, str(title or ""), str(slug or ""))
-    )
+    slug = row.get("slug") or ""
+    event_slug = row.get("eventSlug") or row.get("event_slug") or ""
     return {
         "condition_id": normalized or str(condition_id or ""),
         "title": title,
@@ -758,9 +1000,8 @@ def market_summary_from_cache(
         "volume": safe_float(row.get("volumeNum")) or safe_float(row.get("volume")),
         "liquidity": safe_float(row.get("liquidityNum")) or safe_float(row.get("liquidity")),
         "end_date": row.get("endDate") or row.get("endDateIso") or "",
-        "last_updated_at": file_mtime_iso(cache_path),
-        "cache_path": str(cache_path) if cache_path else "",
-        "cached": bool(cache_path),
+        "last_updated_at": str(row.get("_db_updated_at") or ""),
+        "in_database": bool(row),
         "listed": bool(listed),
         "scanner_signal": False,
         "added_at": added_at,
@@ -769,49 +1010,52 @@ def market_summary_from_cache(
     }
 
 
-def recent_cached_markets(data_dir: str, limit: int = 200) -> List[Dict[str, Any]]:
-    markets_root = Path(data_dir) / "market" / "markets"
-    if not markets_root.exists():
-        return []
-    files = list(markets_root.rglob("market_*.csv"))
-    try:
-        files.sort(key=lambda path: path.stat().st_mtime, reverse=True)
-    except OSError:
-        files.sort(reverse=True)
-    rows: List[Dict[str, Any]] = []
-    for path in files:
-        condition_id = path.stem.removeprefix("market_").lower()
-        normalized = normalize_condition_id(condition_id)
-        if not normalized:
-            continue
-        rows.append(market_summary_from_cache(data_dir, normalized, source="recent-cache"))
-        if len(rows) >= limit:
-            break
-    return rows
-
-
 def load_markets(data_dir: str, reports_dir: str, query: str = "", limit: int = 1000) -> Dict[str, Any]:
+    if not sqlite_database_available(data_dir):
+        return {
+            "count": 0,
+            "shown_count": 0,
+            "loaded_count": 0,
+            "total_market_count": 0,
+            "listed_count": 0,
+            "added_count": 0,
+            "database_count": 0,
+            "rows": [],
+            "scanner_events": [],
+            "scanner_event_count": 0,
+            "source": "database",
+            "error": "database unavailable",
+        }
+
     market_list = load_market_list(ROOT)
     entries = market_list.get("markets", [])
     listed_ids = {entry.get("condition_id") for entry in entries if entry.get("condition_id")}
     rows_by_id: Dict[str, Dict[str, Any]] = {}
 
+    for row in sqlite_load_market_summary_rows(data_dir, query=query, limit=limit):
+        condition_id = normalize_condition_id(row.get("conditionId") or row.get("condition_id"))
+        if condition_id and condition_id not in rows_by_id:
+            rows_by_id[condition_id] = market_summary_from_database(data_dir, condition_id, source="database", db_row=row)
+
     for entry in entries:
         condition_id = str(entry.get("condition_id") or "")
-        rows_by_id[condition_id] = market_summary_from_cache(
-            data_dir,
-            condition_id,
-            listed=True,
-            added_at=str(entry.get("added_at") or ""),
-            source=str(entry.get("source") or "manual"),
-        )
+        if not condition_id:
+            continue
+        summary = rows_by_id.get(condition_id)
+        if summary is None:
+            summary = market_summary_from_database(
+                data_dir,
+                condition_id,
+                listed=True,
+                added_at=str(entry.get("added_at") or ""),
+                source=str(entry.get("source") or "manual"),
+            )
+            rows_by_id[condition_id] = summary
+        summary["listed"] = True
+        summary["added_at"] = summary.get("added_at") or str(entry.get("added_at") or "")
+        summary["source"] = str(entry.get("source") or summary.get("source") or "manual")
 
-    for row in recent_cached_markets(data_dir, limit=limit):
-        condition_id = str(row.get("condition_id") or "")
-        if condition_id and condition_id not in rows_by_id:
-            rows_by_id[condition_id] = row
-
-    scanner = load_scanner(reports_dir, query="", limit=limit)
+    scanner = load_scanner(reports_dir, query="", limit=limit, data_dir=data_dir)
     scanner_events: List[Dict[str, Any]] = []
     seen_scanner = set()
     for event in scanner.get("events", []):
@@ -821,7 +1065,7 @@ def load_markets(data_dir: str, reports_dir: str, query: str = "", limit: int = 
         seen_scanner.add(condition_id)
         summary = rows_by_id.get(condition_id)
         if summary is None:
-            summary = market_summary_from_cache(
+            summary = market_summary_from_database(
                 data_dir,
                 condition_id,
                 listed=condition_id in listed_ids,
@@ -851,10 +1095,8 @@ def load_markets(data_dir: str, reports_dir: str, query: str = "", limit: int = 
             sources.append("Added")
         if row.get("scanner_signal"):
             sources.append("Signal")
-        if not sources and row.get("source") == "recent-cache":
-            sources.append("Recent")
-        if not sources and row.get("cached"):
-            sources.append("Cached")
+        if not sources and row.get("in_database"):
+            sources.append("Database")
         row["source_summary"] = ", ".join(sources) or "Unknown"
 
     rows = [row for row in rows_by_id.values() if row_matches(row, query)]
@@ -866,17 +1108,23 @@ def load_markets(data_dir: str, reports_dir: str, query: str = "", limit: int = 
         ),
         reverse=True,
     )
+    row_limit = max(1, min(limit, 1000))
+    shown_rows = rows[:row_limit]
+    total_market_count = sqlite_count_market_rows(data_dir)
 
     watermarks = load_watermarks(data_dir)
     updates = watermarks.get("updates", {}) if isinstance(watermarks.get("updates"), dict) else {}
     analysis = watermarks.get("analysis", {}) if isinstance(watermarks.get("analysis"), dict) else {}
     return {
         "count": len(rows),
-        "listed_count": len(rows_by_id),
+        "shown_count": len(shown_rows),
+        "loaded_count": len(rows_by_id),
+        "total_market_count": total_market_count,
+        "listed_count": total_market_count,
         "added_count": len(listed_ids),
-        "cached_count": sum(1 for row in rows_by_id.values() if row.get("cached")),
-        "rows": rows[: max(1, min(limit, 1000))],
-        "scanner_events": scanner_events[: max(1, min(limit, 1000))],
+        "database_count": total_market_count,
+        "rows": shown_rows,
+        "scanner_events": scanner_events[:row_limit],
         "scanner_event_count": scanner.get("event_count", 0),
         "watermark": updates.get("markets", {}) if isinstance(updates.get("markets"), dict) else {},
         "trade_watermark": (
@@ -885,7 +1133,7 @@ def load_markets(data_dir: str, reports_dir: str, query: str = "", limit: int = 
         "analysis_watermark": (
             analysis.get("market_scanner", {}) if isinstance(analysis.get("market_scanner"), dict) else {}
         ),
-        "market_list_path": str(market_list_path(ROOT)),
+        "source": "database",
     }
 
 
@@ -915,6 +1163,22 @@ def write_market_ids_file(market_ids: Iterable[str], root: Path | str = ROOT) ->
     path = run_state_dir(root) / "listed_markets_update.txt"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(ids) + ("\n" if ids else ""), encoding="utf-8")
+    return path
+
+
+def write_user_keys_file(user_keys: Iterable[str], root: Path | str = ROOT, prefix: str = "users") -> Path:
+    keys: List[str] = []
+    seen = set()
+    for user_key in user_keys:
+        key = safe_user_key(str(user_key or "").lower())
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        keys.append(key)
+
+    path = run_state_dir(root) / f"{prefix}_{utc_now_compact()}.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(keys) + ("\n" if keys else ""), encoding="utf-8")
     return path
 
 
@@ -991,10 +1255,52 @@ def closed_market_pnl(group: Dict[str, Any], status: Dict[str, Any]) -> Dict[str
     }
 
 
+def user_market_scanner_signal_score(
+    *,
+    capture: float | None,
+    gross_notional: float | None,
+    events: int | None,
+    positive_events: int | None,
+    directional_ratio: float | None,
+) -> float | None:
+    if capture is None and not events:
+        return None
+    capture_roi = (
+        capture / gross_notional
+        if capture is not None and gross_notional is not None and gross_notional > 0
+        else 0.0
+    )
+    capture_score = clamp_score(45.0 + capture_roi * 900.0)
+    event_score = clamp_score(35.0 + (events or 0) * 12.0)
+    hit_score = clamp_score(35.0 + (positive_events or 0) * 10.0)
+    direction_score = clamp_score(45.0 + (directional_ratio or 0.0) * 50.0)
+    score = 0.42 * capture_score + 0.24 * event_score + 0.18 * hit_score + 0.16 * direction_score
+    if capture is not None and capture <= 0:
+        score = min(score, 49.0)
+    return round(clamp_score(score), 1)
+
+
+def load_user_scanner_market_signals(data_dir: str, reports_dir: str, user_key: str) -> Dict[str, Dict[str, Any]]:
+    db_path = default_db_path(data_dir)
+    if not sqlite_database_available(data_dir):
+        return {}
+    signals = sqlite_load_user_scanner_market_signals(db_path, user_key)
+    for rec in signals.values():
+        rec["scanner_signal_score"] = user_market_scanner_signal_score(
+            capture=safe_float(rec.get("scanner_user_jump_capture")),
+            gross_notional=safe_float(rec.get("scanner_user_gross_notional")),
+            events=safe_int(rec.get("scanner_user_event_count")),
+            positive_events=safe_int(rec.get("scanner_user_positive_events")),
+            directional_ratio=safe_float(rec.get("scanner_user_avg_directional_ratio")),
+        )
+    return signals
+
+
 def load_user_trade_history(
     data_dir: str,
     user_key: str,
     *,
+    reports_dir: str = "reports",
     query: str = "",
     limit: int = 1000,
 ) -> Dict[str, Any]:
@@ -1002,47 +1308,16 @@ def load_user_trade_history(
     if not key or key != user_key:
         return {"error": "invalid user key", "user_key": user_key, "total": 0, "rows": []}
 
-    trades_root = Path(data_dir) / "user" / key / "trades"
-    if not trades_root.exists():
-        return {"error": "user trade cache not found", "user_key": key, "total": 0, "rows": []}
-
-    rows: List[Dict[str, Any]] = []
-    total = 0
-    for csv_file in sorted(trades_root.rglob("trade_*.csv")):
-        for raw in read_csv_rows(csv_file, limit=10_000):
-            total += 1
-            if query and not row_matches(raw, query):
-                continue
-
-            size = safe_float(raw.get("size"))
-            price = safe_float(raw.get("price"))
-            notional = size * price if size is not None and price is not None else None
-            ts = safe_float(raw.get("timestamp"))
-            rows.append(
-                {
-                    "timestamp": ts,
-                    "timestamp_utc": to_iso_utc(ts),
-                    "side": raw.get("side", ""),
-                    "outcome": raw.get("outcome", ""),
-                    "outcome_index": safe_int(raw.get("outcomeIndex")),
-                    "price": price,
-                    "size": size,
-                    "notional": notional,
-                    "title": raw.get("title") or raw.get("market_title") or raw.get("slug") or "",
-                    "slug": raw.get("slug", ""),
-                    "event_slug": raw.get("eventSlug", ""),
-                    "condition_id": raw.get("conditionId", ""),
-                    "asset": raw.get("asset", ""),
-                    "transaction_hash": raw.get("transactionHash", ""),
-                }
-            )
+    db_path = default_db_path(data_dir)
+    if not sqlite_database_available(data_dir):
+        return {"error": "database unavailable", "user_key": key, "total": 0, "rows": []}
+    rows, total, _matched = sqlite_load_user_trade_rows(db_path, key, query=query)
 
     rows.sort(key=lambda row: safe_float(row.get("timestamp")) or -1.0, reverse=True)
     limited_rows = rows[: max(1, min(limit, 5000))]
-    market_statuses = load_market_statuses(
-        data_dir,
-        {str(row.get("condition_id") or "").strip().lower() for row in rows if row.get("condition_id")},
-    )
+    condition_ids = {str(row.get("condition_id") or "").strip().lower() for row in rows if row.get("condition_id")}
+    market_statuses = sqlite_load_market_statuses(db_path, condition_ids)
+    scanner_signals = load_user_scanner_market_signals(data_dir, reports_dir, key)
     groups_by_market: Dict[str, Dict[str, Any]] = {}
     for row in rows:
         market_key = str(row.get("condition_id") or row.get("slug") or row.get("title") or "unknown")
@@ -1130,6 +1405,9 @@ def load_user_trade_history(
             group["market_status"] = "unknown"
             group["market_status_label"] = "Unknown"
             group["market_end_date"] = ""
+        scanner_signal = scanner_signals.get(str(group.get("condition_id") or "").strip().lower())
+        if scanner_signal:
+            group.update(scanner_signal)
         group.pop("positions_by_index", None)
         group.pop("positions_by_label", None)
         group["trades"].sort(key=lambda trade: safe_float(trade.get("timestamp")) or -1.0, reverse=True)
@@ -1151,20 +1429,20 @@ def load_user_trade_history(
     }
 
 
-def static_file_payload(path: Path) -> bytes:
-    resolved = path.resolve()
-    root = ROOT.resolve()
-    if not str(resolved).lower().startswith(str(root).lower()):
-        raise OSError("refusing path outside workspace")
-    return path.read_bytes()
-
-
 INDEX_HTML = """<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Polymarket Information Edge Dashboard</title>
+  <script>
+    (() => {
+      try {
+        const theme = localStorage.getItem("polymarket-dashboard-theme");
+        if (theme === "dark" || theme === "light") document.documentElement.dataset.theme = theme;
+      } catch (_error) {}
+    })();
+  </script>
   <style>
     :root {
       color-scheme: light;
@@ -1180,6 +1458,95 @@ INDEX_HTML = """<!doctype html>
       --warn: #9a5b00;
       --bad: #b42318;
       --good: #087443;
+      --accent-ink: #ffffff;
+      --control: #ffffff;
+      --control-active: #edf7f6;
+      --table-head: #fafbfc;
+      --row-hover: #fbfcfe;
+      --row-selected: #edf7f6;
+      --detail-bg: #fbfcfe;
+      --toast-bg: #101828;
+      --toast-ink: #ffffff;
+      --toast-shadow: rgba(16, 24, 40, 0.22);
+      --log-bg: #101828;
+      --log-ink: #eff4ff;
+      --sort-muted: #98a2b3;
+      --market-row-open: #f0fdf4;
+      --market-row-closed: #f8fafc;
+      --market-row-ended: #fffbeb;
+      --market-row-unknown: #f9fafb;
+      --market-open-bg: #dcfce7;
+      --market-open-ink: #166534;
+      --market-open-line: #86efac;
+      --market-closed-bg: #e5e7eb;
+      --market-closed-ink: #374151;
+      --market-closed-line: #cbd5e1;
+      --market-ended-bg: #fef3c7;
+      --market-ended-ink: #92400e;
+      --market-ended-line: #fcd34d;
+      --market-unknown-bg: #eef2f6;
+      --market-unknown-ink: #475467;
+      --score-bg: #eef2f6;
+      --score-strong-bg: #fee4e2;
+      --score-strong-ink: #912018;
+      --score-elevated-bg: #fffaeb;
+      --score-elevated-ink: #93370d;
+      --score-watch-bg: #eff8ff;
+      --score-watch-ink: #175cd3;
+      --score-baseline-bg: #f2f4f7;
+      --score-baseline-ink: #475467;
+    }
+    html[data-theme="dark"] {
+      color-scheme: dark;
+      --bg: #0d1116;
+      --panel: #151b22;
+      --ink: #e7edf3;
+      --muted: #9aa8b5;
+      --line: #2d3944;
+      --soft: #202a33;
+      --accent: #39b7aa;
+      --accent-strong: #67d7cc;
+      --blue: #7db3ff;
+      --warn: #f2b458;
+      --bad: #ff897f;
+      --good: #66d39a;
+      --accent-ink: #071312;
+      --control: #1a222b;
+      --control-active: #123b38;
+      --table-head: #1b242d;
+      --row-hover: #202a33;
+      --row-selected: #123b38;
+      --detail-bg: #111820;
+      --toast-bg: #e7edf3;
+      --toast-ink: #0d1116;
+      --toast-shadow: rgba(0, 0, 0, 0.42);
+      --log-bg: #090d12;
+      --log-ink: #dbe7f3;
+      --sort-muted: #6f7e8c;
+      --market-row-open: #102419;
+      --market-row-closed: #1b2229;
+      --market-row-ended: #2a2211;
+      --market-row-unknown: #192129;
+      --market-open-bg: #123b25;
+      --market-open-ink: #96e6b8;
+      --market-open-line: #247348;
+      --market-closed-bg: #26313a;
+      --market-closed-ink: #c5d0db;
+      --market-closed-line: #40505f;
+      --market-ended-bg: #3b2c0d;
+      --market-ended-ink: #ffd98a;
+      --market-ended-line: #8f6817;
+      --market-unknown-bg: #222c35;
+      --market-unknown-ink: #c1ccd7;
+      --score-bg: #222c35;
+      --score-strong-bg: #451d1a;
+      --score-strong-ink: #ffb0a8;
+      --score-elevated-bg: #3b2c0d;
+      --score-elevated-ink: #ffd98a;
+      --score-watch-bg: #142d4a;
+      --score-watch-ink: #9ed0ff;
+      --score-baseline-bg: #26313a;
+      --score-baseline-ink: #c5d0db;
     }
     * { box-sizing: border-box; }
     body {
@@ -1189,30 +1556,12 @@ INDEX_HTML = """<!doctype html>
       font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       font-size: 14px;
     }
-    header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-      padding: 14px 20px;
-      background: #ffffff;
-      border-bottom: 1px solid var(--line);
-      position: sticky;
-      top: 0;
-      z-index: 4;
-    }
-    h1 {
-      margin: 0;
-      font-size: 20px;
-      font-weight: 750;
-      letter-spacing: 0;
-    }
     main {
       max-width: 1600px;
       margin: 0 auto;
-      padding: 16px 20px 28px;
+      padding: 4px 16px 12px;
       display: grid;
-      gap: 16px;
+      gap: 8px;
     }
     section {
       background: var(--panel);
@@ -1224,10 +1573,10 @@ INDEX_HTML = """<!doctype html>
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 12px;
-      padding: 12px 14px;
+      gap: 8px;
+      padding: 6px 10px;
       border-bottom: 1px solid var(--line);
-      min-height: 54px;
+      min-height: 38px;
     }
     .bar h2 {
       margin: 0;
@@ -1237,29 +1586,72 @@ INDEX_HTML = """<!doctype html>
     .muted { color: var(--muted); }
     .tabs {
       display: flex;
-      gap: 6px;
-      padding: 10px;
-      background: #ffffff;
+      gap: 4px;
+      padding: 5px;
+      background: var(--panel);
       border-bottom: 1px solid var(--line);
       overflow-x: auto;
     }
     .tab {
       border: 1px solid var(--line);
-      background: #ffffff;
+      background: var(--control);
       color: var(--ink);
       border-radius: 6px;
-      min-height: 34px;
-      padding: 7px 11px;
+      min-height: 28px;
+      padding: 4px 9px;
       font-weight: 650;
       cursor: pointer;
     }
     .tab.active {
       border-color: var(--accent);
       background: var(--accent);
-      color: #ffffff;
+      color: var(--accent-ink);
+    }
+    .theme-toggle {
+      margin-left: auto;
+      flex: 0 0 auto;
+      min-height: 28px;
+      min-width: 68px;
+    }
+    .tab.loading::after {
+      content: "";
+      width: 10px;
+      height: 10px;
+      margin-left: 7px;
+      border-radius: 50%;
+      border: 2px solid currentColor;
+      border-top-color: transparent;
+      animation: spin 0.75s linear infinite;
     }
     .view { display: none; }
-    .view.active { display: grid; gap: 16px; }
+    .view.active { display: grid; gap: 10px; }
+    .view.loading::after {
+      content: attr(data-loading);
+      position: fixed;
+      top: 46px;
+      right: 18px;
+      z-index: 30;
+      min-width: 150px;
+      max-width: min(360px, calc(100vw - 36px));
+      padding: 7px 10px;
+      border-radius: 6px;
+      background: var(--toast-bg);
+      color: var(--toast-ink);
+      box-shadow: 0 8px 24px var(--toast-shadow);
+      font-size: 12px;
+      font-weight: 750;
+      line-height: 1.2;
+    }
+    #view-users.active {
+      height: calc(100vh - 72px);
+      min-height: 480px;
+      overflow: hidden;
+    }
+    #view-jobs.active {
+      height: calc(100vh - 72px);
+      min-height: 480px;
+      grid-template-rows: auto minmax(0, 1fr);
+    }
     .metrics {
       display: grid;
       grid-template-columns: repeat(5, minmax(130px, 1fr));
@@ -1268,40 +1660,40 @@ INDEX_HTML = """<!doctype html>
     }
     .metric {
       background: var(--panel);
-      padding: 14px;
-      min-height: 82px;
+      padding: 8px 10px;
+      min-height: 56px;
     }
     .metric span {
       display: block;
       color: var(--muted);
       font-size: 12px;
-      margin-bottom: 8px;
+      margin-bottom: 4px;
     }
     .metric strong {
       display: block;
-      font-size: 23px;
+      font-size: 20px;
       line-height: 1.1;
       letter-spacing: 0;
     }
     .actions {
       display: grid;
       grid-template-columns: repeat(7, minmax(130px, 1fr));
-      gap: 8px;
-      padding: 12px;
+      gap: 6px;
+      padding: 8px;
     }
     button, a.button {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      min-height: 36px;
       border-radius: 6px;
       border: 1px solid var(--line);
-      background: #ffffff;
+      background: var(--control);
       color: var(--ink);
       font: inherit;
       font-weight: 650;
       cursor: pointer;
-      padding: 7px 10px;
+      min-height: 30px;
+      padding: 4px 8px;
       text-decoration: none;
       white-space: normal;
       text-align: center;
@@ -1309,29 +1701,36 @@ INDEX_HTML = """<!doctype html>
     button.primary, a.button.primary {
       background: var(--accent);
       border-color: var(--accent);
-      color: #ffffff;
+      color: var(--accent-ink);
     }
     button:hover, a.button:hover { border-color: var(--accent); }
     button.primary:hover, a.button.primary:hover { background: var(--accent-strong); }
+    button.toggle.active {
+      background: var(--control-active);
+      border-color: var(--accent);
+      color: var(--accent-strong);
+    }
     button:disabled { cursor: not-allowed; opacity: 0.55; }
     .tools {
       display: flex;
       align-items: center;
-      gap: 8px;
+      gap: 6px;
       flex-wrap: wrap;
     }
     input[type="search"], input[type="text"] {
-      min-height: 36px;
+      min-height: 30px;
       border: 1px solid var(--line);
       border-radius: 6px;
-      padding: 6px 10px;
+      padding: 4px 8px;
       font: inherit;
       min-width: 260px;
-      background: #ffffff;
+      background: var(--control);
+      color: var(--ink);
     }
+    input::placeholder { color: var(--muted); }
     button.mini {
-      min-height: 28px;
-      padding: 4px 8px;
+      min-height: 24px;
+      padding: 2px 6px;
       font-size: 12px;
     }
     table {
@@ -1341,17 +1740,18 @@ INDEX_HTML = """<!doctype html>
     }
     th, td {
       text-align: left;
-      padding: 9px 10px;
+      padding: 5px 8px;
       border-bottom: 1px solid var(--line);
       vertical-align: top;
       overflow: hidden;
       text-overflow: ellipsis;
+      line-height: 1.25;
     }
     th {
       color: var(--muted);
       font-size: 12px;
       font-weight: 700;
-      background: #fafbfc;
+      background: var(--table-head);
     }
     th.sortable {
       cursor: pointer;
@@ -1359,7 +1759,7 @@ INDEX_HTML = """<!doctype html>
     }
     th.sortable::after {
       content: " <> ";
-      color: #98a2b3;
+      color: var(--sort-muted);
       font-weight: 700;
     }
     th.sortable.sorted.asc::after {
@@ -1370,10 +1770,10 @@ INDEX_HTML = """<!doctype html>
       content: " v";
       color: var(--accent);
     }
-    tbody tr:hover td { background: #fbfcfe; }
+    tbody tr:hover td { background: var(--row-hover); }
     tr.clickable { cursor: pointer; }
     tr.clickable.selected td {
-      background: #edf7f6;
+      background: var(--row-selected);
       box-shadow: inset 3px 0 0 var(--accent);
     }
     .num { text-align: right; font-variant-numeric: tabular-nums; }
@@ -1381,13 +1781,13 @@ INDEX_HTML = """<!doctype html>
     .status-running, .status-queued, .status-cancelled, .warn { color: var(--warn); font-weight: 700; }
     .status-failed, .bad { color: var(--bad); font-weight: 700; }
     .expand {
-      width: 30px;
-      min-height: 28px;
+      width: 26px;
+      min-height: 24px;
       padding: 0;
       font-weight: 800;
     }
     .detail-row td {
-      background: #fbfcfe;
+      background: var(--detail-bg);
       padding: 0;
     }
     .nested {
@@ -1397,78 +1797,85 @@ INDEX_HTML = """<!doctype html>
       border-top: 1px solid var(--line);
     }
     .nested th, .nested td {
-      padding: 7px 10px;
+      padding: 4px 8px;
       font-size: 12px;
     }
-    .market-row-open td { background: #f0fdf4; }
-    .market-row-closed td { background: #f8fafc; }
-    .market-row-ended td { background: #fffbeb; }
-    .market-row-unknown td { background: #f9fafb; }
+    .market-row-open td { background: var(--market-row-open); }
+    .market-row-closed td { background: var(--market-row-closed); }
+    .market-row-ended td { background: var(--market-row-ended); }
+    .market-row-unknown td { background: var(--market-row-unknown); }
     .market-status-pill {
       display: inline-block;
       border-radius: 999px;
-      padding: 2px 8px;
-      margin-right: 7px;
+      padding: 1px 6px;
+      margin-right: 5px;
       font-size: 12px;
       font-weight: 800;
       border: 1px solid var(--line);
     }
     .market-status-open {
-      background: #dcfce7;
-      color: #166534;
-      border-color: #86efac;
+      background: var(--market-open-bg);
+      color: var(--market-open-ink);
+      border-color: var(--market-open-line);
     }
     .market-status-closed {
-      background: #e5e7eb;
-      color: #374151;
-      border-color: #cbd5e1;
+      background: var(--market-closed-bg);
+      color: var(--market-closed-ink);
+      border-color: var(--market-closed-line);
     }
     .market-status-ended {
-      background: #fef3c7;
-      color: #92400e;
-      border-color: #fcd34d;
+      background: var(--market-ended-bg);
+      color: var(--market-ended-ink);
+      border-color: var(--market-ended-line);
     }
     .market-status-unknown {
-      background: #eef2f6;
-      color: #475467;
+      background: var(--market-unknown-bg);
+      color: var(--market-unknown-ink);
     }
     .score {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      min-width: 54px;
+      min-width: 48px;
       border-radius: 6px;
-      padding: 3px 8px;
+      padding: 2px 6px;
       font-weight: 800;
       font-variant-numeric: tabular-nums;
-      background: #eef2f6;
+      background: var(--score-bg);
       color: var(--ink);
     }
     .score-strong {
-      background: #fee4e2;
-      color: #912018;
+      background: var(--score-strong-bg);
+      color: var(--score-strong-ink);
     }
     .score-elevated {
-      background: #fffaeb;
-      color: #93370d;
+      background: var(--score-elevated-bg);
+      color: var(--score-elevated-ink);
     }
     .score-watch {
-      background: #eff8ff;
-      color: #175cd3;
+      background: var(--score-watch-bg);
+      color: var(--score-watch-ink);
     }
     .score-baseline {
-      background: #f2f4f7;
-      color: #475467;
+      background: var(--score-baseline-bg);
+      color: var(--score-baseline-ink);
     }
     .evidence {
-      line-height: 1.35;
+      line-height: 1.25;
       white-space: normal;
+    }
+    .evidence-compact {
+      display: block;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
     .pill {
       display: inline-block;
       border: 1px solid var(--line);
       border-radius: 999px;
-      padding: 2px 8px;
+      padding: 1px 6px;
       background: var(--soft);
       font-size: 12px;
       font-weight: 700;
@@ -1485,41 +1892,102 @@ INDEX_HTML = """<!doctype html>
     .grid-2 {
       display: grid;
       grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
-      gap: 16px;
+      gap: 10px;
     }
     .workspace-grid {
       display: grid;
       grid-template-columns: minmax(460px, 0.9fr) minmax(0, 1.1fr);
-      gap: 16px;
+      gap: 10px;
       align-items: start;
     }
     .user-workspace {
       display: grid;
-      grid-template-columns: minmax(440px, 0.85fr) minmax(0, 1.15fr);
-      gap: 16px;
-      align-items: start;
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: minmax(0, 7fr) minmax(220px, 3fr);
+      gap: 10px;
+      align-items: stretch;
+      min-height: 0;
+      height: 100%;
+      overflow: hidden;
+    }
+    .user-workspace section {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden;
     }
     .table-wrap {
       overflow-x: auto;
     }
+    .user-workspace .table-wrap {
+      flex: 1;
+      min-height: 0;
+      overflow: auto;
+    }
+    .user-workspace table {
+      min-width: 1420px;
+    }
+    .user-workspace section:nth-child(2) table {
+      min-width: 1600px;
+    }
+    .user-workspace th {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+    }
+    .user-workspace td {
+      white-space: nowrap;
+    }
+    .jobs-table-wrap {
+      max-height: 205px;
+      overflow: auto;
+    }
+    .jobs-log-panel {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+    .jobs-log-panel .log {
+      flex: 1;
+      min-height: 0;
+      max-height: none;
+    }
     .log {
       margin: 0;
-      padding: 14px;
-      background: #101828;
-      color: #eff4ff;
-      min-height: 300px;
+      padding: 10px;
+      background: var(--log-bg);
+      color: var(--log-ink);
+      min-height: 220px;
       max-height: 520px;
       overflow: auto;
       font-size: 12px;
-      line-height: 1.45;
+      line-height: 1.35;
     }
     .empty {
-      padding: 22px;
+      padding: 14px;
       color: var(--muted);
     }
+    .loading-cell {
+      color: var(--muted);
+      font-weight: 700;
+    }
+    .loading-spinner {
+      display: inline-block;
+      width: 12px;
+      height: 12px;
+      margin-right: 8px;
+      border-radius: 50%;
+      border: 2px solid var(--sort-muted);
+      border-top-color: var(--accent);
+      vertical-align: -2px;
+      animation: spin 0.75s linear infinite;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
     @media (max-width: 1100px) {
-      header { align-items: flex-start; flex-direction: column; }
-      main { padding: 12px; }
+      main { padding: 8px; }
       .metrics, .actions, .grid-2, .workspace-grid, .user-workspace { grid-template-columns: 1fr; }
       input[type="search"] { min-width: 0; width: 100%; }
       input[type="text"] { min-width: 0; width: 100%; }
@@ -1527,21 +1995,13 @@ INDEX_HTML = """<!doctype html>
   </style>
 </head>
 <body>
-  <header>
-    <h1>Polymarket Information Edge</h1>
-    <div class="tools">
-      <span class="muted" id="generated">Loading</span>
-      <button id="refresh">Refresh</button>
-      <a class="button" href="/static/user-dashboard" target="_blank">User HTML</a>
-      <a class="button" href="/static/market-dashboard" target="_blank">Legacy Market HTML</a>
-    </div>
-  </header>
   <main>
     <nav class="tabs">
       <button class="tab active" data-tab="overview">Overview</button>
       <button class="tab" data-tab="markets">Markets</button>
       <button class="tab" data-tab="users">Users</button>
       <button class="tab" data-tab="jobs">Jobs</button>
+      <button class="theme-toggle" id="theme-toggle" type="button" aria-pressed="false" title="Switch to dark mode">Dark</button>
     </nav>
 
     <div class="view active" id="view-overview">
@@ -1565,10 +2025,10 @@ INDEX_HTML = """<!doctype html>
         </div>
         <div class="metrics">
           <div class="metric"><span>Users</span><strong id="m-users">0</strong></div>
-          <div class="metric"><span>User Trade Files</span><strong id="m-user-trades">0</strong></div>
-          <div class="metric"><span>Market Files</span><strong id="m-markets">0</strong></div>
-          <div class="metric"><span>Price Files</span><strong id="m-prices">0</strong></div>
-          <div class="metric"><span>Trade Caches</span><strong id="m-trades">0</strong></div>
+          <div class="metric"><span>User Trade Rows</span><strong id="m-user-trades">0</strong></div>
+          <div class="metric"><span>Market Rows</span><strong id="m-markets">0</strong></div>
+          <div class="metric"><span>Price Assets</span><strong id="m-prices">0</strong></div>
+          <div class="metric"><span>Market Trade Sets</span><strong id="m-trades">0</strong></div>
         </div>
       </section>
       <section>
@@ -1580,7 +2040,6 @@ INDEX_HTML = """<!doctype html>
           <button data-action="analyze_scanner">Analyze Markets</button>
           <button data-action="update_users_quick">Update Users Fast</button>
           <button data-action="update_users_full">Update Users Full</button>
-          <button data-action="build_dashboards">Build HTML</button>
         </div>
       </section>
       <div class="grid-2">
@@ -1616,12 +2075,13 @@ INDEX_HTML = """<!doctype html>
         </div>
         <div class="metrics">
           <div class="metric"><span>Markets</span><strong id="mk-listed">0</strong></div>
-          <div class="metric"><span>Cached</span><strong id="mk-cached">0</strong></div>
+          <div class="metric"><span>Shown</span><strong id="mk-shown">0</strong></div>
+          <div class="metric"><span>In Database</span><strong id="mk-database">0</strong></div>
           <div class="metric"><span>Signals</span><strong id="mk-events">0</strong></div>
           <div class="metric"><span>Market Update</span><strong id="mk-watermark">None</strong></div>
           <div class="metric"><span>Trade Update</span><strong id="mk-trade-watermark">None</strong></div>
           <div class="metric"><span>Analyzed</span><strong id="mk-analysis-watermark">None</strong></div>
-          <div class="metric"><span>List File</span><strong id="mk-path">-</strong></div>
+          <div class="metric"><span>Manual Adds</span><strong id="mk-added">0</strong></div>
         </div>
       </section>
       <div>
@@ -1660,14 +2120,19 @@ INDEX_HTML = """<!doctype html>
             <h2>Users</h2>
             <div class="tools">
               <input type="search" id="user-search" placeholder="Search users">
+              <input type="text" id="user-id-input" placeholder="User handle or wallet">
+              <button class="primary" id="update-user-input">Update User</button>
+              <button class="toggle" id="candidate-filter">Candidate Users</button>
+              <button data-action="update_candidate_users" id="update-candidate-users">Update Candidate Users</button>
               <button data-action="update_users_quick">Update All Users</button>
             </div>
           </div>
           <div class="metrics">
             <div class="metric"><span>Analyzed Users</span><strong id="user-total-count">0</strong></div>
             <div class="metric"><span>Shown</span><strong id="user-shown-count">0</strong></div>
-            <div class="metric"><span>Cached User Folders</span><strong id="user-cached-count">0</strong></div>
+            <div class="metric"><span>Users In Database</span><strong id="user-database-count">0</strong></div>
             <div class="metric"><span>Scanner Candidates</span><strong id="user-candidate-count">0</strong></div>
+            <div class="metric"><span>Shown Candidates</span><strong id="user-shown-candidate-count">0</strong></div>
           </div>
           <div class="table-wrap">
             <table>
@@ -1676,7 +2141,9 @@ INDEX_HTML = """<!doctype html>
                   <th class="sortable" data-sort-table="users" data-sort-key="user_key" data-sort-type="text">User</th>
                   <th class="num sortable" data-sort-table="users" data-sort-key="info_edge_score" data-sort-type="number">Edge</th>
                   <th class="sortable" data-sort-table="users" data-sort-key="info_edge_tier" data-sort-type="text">Tier</th>
-                  <th class="sortable" data-sort-table="users" data-sort-key="evidence_summary" data-sort-type="text">Evidence</th>
+                  <th class="num sortable" data-sort-table="users" data-sort-key="monetized_edge_per_trade_usdc" data-sort-type="number">Info $/Trade</th>
+                  <th class="num sortable" data-sort-table="users" data-sort-key="candidate_jump_capture" data-sort-type="number">Jump $</th>
+                  <th class="num sortable" data-sort-table="users" data-sort-key="candidate_events" data-sort-type="number">Events</th>
                   <th class="num sortable" data-sort-table="users" data-sort-key="skill_index" data-sort-type="number">Skill</th>
                   <th class="num sortable" data-sort-table="users" data-sort-key="raw_pnl_usdc" data-sort-type="number">PnL</th>
                   <th class="num sortable" data-sort-table="users" data-sort-key="total_trades" data-sort-type="number">Trades</th>
@@ -1695,6 +2162,7 @@ INDEX_HTML = """<!doctype html>
               <span class="muted" id="trade-summary">Select a user</span>
               <input type="search" id="trade-search" placeholder="Search selected user trades">
               <button id="update-selected-user" disabled>Update User</button>
+              <button id="analyze-selected-user" disabled>Analyze User</button>
             </div>
           </div>
           <div class="table-wrap">
@@ -1703,6 +2171,7 @@ INDEX_HTML = """<!doctype html>
                 <tr>
                   <th></th>
                   <th class="sortable" data-sort-table="trades" data-sort-key="title" data-sort-type="text">Market</th>
+                  <th class="num sortable" data-sort-table="trades" data-sort-key="scanner_signal_score" data-sort-type="number">Signal</th>
                   <th class="sortable" data-sort-table="trades" data-sort-key="market_status" data-sort-type="text">Status</th>
                   <th class="sortable" data-sort-table="trades" data-sort-key="market_end_date" data-sort-type="text">Closes</th>
                   <th class="sortable" data-sort-table="trades" data-sort-key="outcome_summary" data-sort-type="text">Outcomes</th>
@@ -1723,26 +2192,19 @@ INDEX_HTML = """<!doctype html>
     </div>
 
     <div class="view" id="view-jobs">
-      <div class="grid-2">
-        <section>
-          <div class="bar"><h2>Latest Runs</h2></div>
+      <section class="jobs-run-list">
+        <div class="bar"><h2>Runs</h2><span class="muted">Newest first</span></div>
+        <div class="table-wrap jobs-table-wrap">
           <table>
-            <thead><tr><th class="sortable" data-sort-table="runs" data-sort-key="name" data-sort-type="text">Name</th><th class="sortable" data-sort-table="runs" data-sort-key="status" data-sort-type="text">Status</th><th class="sortable" data-sort-table="runs" data-sort-key="started_at" data-sort-type="text">Started</th><th class="num sortable" data-sort-table="runs" data-sort-key="duration_seconds" data-sort-type="number">Duration</th></tr></thead>
-            <tbody id="runs"></tbody>
-          </table>
-        </section>
-        <section>
-          <div class="bar"><h2>Jobs</h2></div>
-          <table>
-            <thead><tr><th class="sortable" data-sort-table="jobs" data-sort-key="label" data-sort-type="text">Job</th><th class="sortable" data-sort-table="jobs" data-sort-key="status" data-sort-type="text">Status</th><th class="sortable" data-sort-table="jobs" data-sort-key="created_at" data-sort-type="text">Created</th><th></th></tr></thead>
+            <thead><tr><th class="sortable" data-sort-table="jobs" data-sort-key="created_at" data-sort-type="text">Started</th><th class="sortable" data-sort-table="jobs" data-sort-key="label" data-sort-type="text">Run</th><th class="sortable" data-sort-table="jobs" data-sort-key="status" data-sort-type="text">Status</th><th></th></tr></thead>
             <tbody id="jobs"></tbody>
           </table>
-        </section>
-      </div>
-      <section>
+        </div>
+      </section>
+      <section class="jobs-log-panel">
         <div class="bar">
           <h2>Log</h2>
-          <span class="muted" id="log-title">No job selected</span>
+          <span class="muted" id="log-title">No run selected</span>
         </div>
         <pre class="log" id="log"></pre>
       </section>
@@ -1750,10 +2212,34 @@ INDEX_HTML = """<!doctype html>
   </main>
   <script>
     const $ = (id) => document.getElementById(id);
+    const themeStorageKey = "polymarket-dashboard-theme";
+    function themeName() {
+      return document.documentElement.dataset.theme === "dark" ? "dark" : "light";
+    }
+    function applyTheme(theme) {
+      const nextTheme = theme === "dark" ? "dark" : "light";
+      document.documentElement.dataset.theme = nextTheme;
+      try { localStorage.setItem(themeStorageKey, nextTheme); } catch (_error) {}
+      const button = $("theme-toggle");
+      if (button) {
+        const dark = nextTheme === "dark";
+        button.textContent = dark ? "Light" : "Dark";
+        button.setAttribute("aria-pressed", dark ? "true" : "false");
+        button.title = dark ? "Switch to light mode" : "Switch to dark mode";
+      }
+    }
     let selectedJob = null;
     let selectedUser = null;
     let currentTab = "overview";
     let activeJobCount = 0;
+    let userCandidateOnly = false;
+    const loadingState = {
+      status: "",
+      markets: "",
+      users: "",
+      trades: "",
+      log: "",
+    };
     const expandedMarkets = new Set();
     const state = { status: null, users: null, trades: null, markets: null };
     const sortState = {
@@ -1761,7 +2247,6 @@ INDEX_HTML = """<!doctype html>
       overviewUsers: { key: "info_edge_score", dir: "desc", type: "number" },
       markets: { key: "signal_score", dir: "desc", type: "number" },
       users: { key: "info_edge_score", dir: "desc", type: "number" },
-      runs: { key: "started_at", dir: "desc", type: "text" },
       jobs: { key: "created_at", dir: "desc", type: "text" },
       trades: { key: "last_timestamp", dir: "desc", type: "number" },
       tradeDetails: { key: "timestamp", dir: "desc", type: "number" }
@@ -1791,14 +2276,26 @@ INDEX_HTML = """<!doctype html>
       if (n >= 55) return "score score-watch";
       return "score score-baseline";
     }
-    function scoreCell(value) {
+    function scoreCell(value, title = "") {
+      if (value === null || value === undefined || value === "") return "";
       const n = Number(value);
       if (!Number.isFinite(n)) return "";
-      return `<span class="${scoreClass(n)}">${num(n, 1)}</span>`;
+      const titleAttr = title ? ` title="${esc(title)}" alt="${esc(title)}"` : "";
+      return `<span class="${scoreClass(n)}"${titleAttr}>${num(n, 1)}</span>`;
+    }
+    function money(value, digits = 2) {
+      if (value === null || value === undefined || value === "") return "";
+      const n = Number(value);
+      if (!Number.isFinite(n)) return "";
+      const sign = n < 0 ? "-" : "";
+      return sign + "$" + Math.abs(n).toLocaleString(undefined, { maximumFractionDigits: digits, minimumFractionDigits: digits });
     }
     function shortWallet(value) {
       const text = String(value || "");
       return text.length > 18 ? text.slice(0, 10) + "..." + text.slice(-6) : text;
+    }
+    function isWallet(value) {
+      return /^0x[a-fA-F0-9]{40}$/.test(String(value || "").trim());
     }
     function shortDate(value) {
       const text = String(value || "");
@@ -1812,7 +2309,9 @@ INDEX_HTML = """<!doctype html>
     }
     function polymarketUserUrl(userKey) {
       const key = String(userKey || "").trim();
-      return key ? "https://polymarket.com/profile/" + encodeURIComponent(key) : "";
+      if (!key) return "";
+      const profileKey = /^0x[a-fA-F0-9]{40}$/.test(key) || key.startsWith("@") ? key : "@" + key;
+      return "https://polymarket.com/profile/" + encodeURIComponent(profileKey);
     }
     function polymarketMarketUrl(row) {
       if (!row) return "";
@@ -1824,8 +2323,35 @@ INDEX_HTML = """<!doctype html>
       const slug = eventSlug || marketSlug;
       return slug ? "https://polymarket.com/event/" + encodeURIComponent(slug) : "";
     }
-    function userLink(userKey, short = false) {
-      return externalLink(polymarketUserUrl(userKey), short ? shortWallet(userKey) : userKey, userKey);
+    function userLink(userKey, short = false, label = "") {
+      const text = label || (short ? shortWallet(userKey) : userKey);
+      return externalLink(polymarketUserUrl(userKey), text, userKey);
+    }
+    function userAliasName(row) {
+      const key = String(row && row.user_key ? row.user_key : "").trim();
+      const fallbackShort = shortWallet(key).toLowerCase();
+      const fallbackKey = key.toLowerCase();
+      const values = row ? [row.display_name, row.profile_name, row.profile_pseudonym, row.input_user] : [];
+      for (const value of values) {
+        const text = String(value || "").trim();
+        if (!text || isWallet(text)) continue;
+        const comparable = text.toLowerCase();
+        if (comparable === fallbackKey || comparable === fallbackShort) continue;
+        return text;
+      }
+      return "";
+    }
+    function userLabel(row, short = false) {
+      const key = row && row.user_key ? row.user_key : "";
+      const name = userAliasName(row);
+      return name || (short ? shortWallet(key) : key);
+    }
+    function userCell(row, short = false) {
+      const key = row && row.user_key ? row.user_key : "";
+      const name = userAliasName(row);
+      const label = userLabel(row, short);
+      const sub = name ? `<div class="muted" title="${esc(key)}">${esc(shortWallet(key))}</div>` : "";
+      return `${userLink(key, short, label)}${sub}`;
     }
     function marketLink(row) {
       const label = (row && (row.title || row.slug || row.condition_id)) || "";
@@ -1841,6 +2367,43 @@ INDEX_HTML = """<!doctype html>
     }
     function emptyRow(cols, label = "No rows") {
       return `<tr><td colspan="${cols}" class="empty">${esc(label)}</td></tr>`;
+    }
+    function loadingRow(cols, label = "Loading") {
+      return `<tr><td colspan="${cols}" class="loading-cell"><span class="loading-spinner"></span>${esc(label)}</td></tr>`;
+    }
+    function errorRow(cols, error, fallback = "Unable to load rows") {
+      const message = error && error.message ? error.message : String(error || fallback);
+      return `<tr><td colspan="${cols}" class="empty bad">${esc(message)}</td></tr>`;
+    }
+    function loadingTab(name) {
+      if (name === "status" || name === "log") return "jobs";
+      if (name === "trades") return "users";
+      return name;
+    }
+    function updateLoadingChrome() {
+      ["overview", "markets", "users", "jobs"].forEach(tabName => {
+        const labels = Object.entries(loadingState)
+          .filter(([name, label]) => label && loadingTab(name) === tabName)
+          .map(([, label]) => label);
+        const active = labels.length > 0;
+        const button = document.querySelector(`.tab[data-tab="${tabName}"]`);
+        const view = $("view-" + tabName);
+        if (button) {
+          button.classList.toggle("loading", active);
+          button.setAttribute("aria-busy", active ? "true" : "false");
+        }
+        if (view) {
+          view.classList.toggle("loading", active);
+          view.dataset.loading = labels[0] || "";
+        }
+      });
+    }
+    function setLoading(name, active, label = "Loading") {
+      loadingState[name] = active ? label : "";
+      updateLoadingChrome();
+    }
+    function nextFrame() {
+      return new Promise(resolve => requestAnimationFrame(resolve));
     }
     function sortValue(row, key, type) {
       const value = row ? row[key] : null;
@@ -1879,7 +2442,7 @@ INDEX_HTML = """<!doctype html>
     function rerenderTable(tableName) {
       if (["overviewUsers", "users"].includes(tableName) && state.users) renderUsers(state.users);
       if (["overviewMarkets", "markets"].includes(tableName) && state.markets) renderMarkets(state.markets);
-      if (["runs", "jobs"].includes(tableName) && state.status) renderStatus(state.status);
+      if (tableName === "jobs" && state.status) renderStatus(state.status);
       if (tableName === "trades" && state.trades) renderTrades(state.trades);
       updateSortIndicators();
     }
@@ -1887,36 +2450,49 @@ INDEX_HTML = """<!doctype html>
       currentTab = name;
       document.querySelectorAll(".tab").forEach(btn => btn.classList.toggle("active", btn.dataset.tab === name));
       document.querySelectorAll(".view").forEach(view => view.classList.toggle("active", view.id === "view-" + name));
+      if (name === "markets" && !state.markets && !loadingState.markets) refreshMarkets();
+      if (name === "users" && !state.users && !loadingState.users) refreshUsers();
+      if (name === "jobs" && !state.status && !loadingState.status) refreshStatus(false);
     }
     function renderStatus(data) {
       const inv = data.inventory || {};
-      $("generated").textContent = "Updated " + (inv.generated_at || data.now || "");
+      const generated = $("generated");
+      if (generated) generated.textContent = "Updated " + (inv.generated_at || data.now || "");
       $("m-users").textContent = intNum(inv.user_count || 0);
-      $("m-user-trades").textContent = intNum(inv.user_trade_files || 0);
-      $("m-markets").textContent = intNum(inv.market_metadata_files || 0);
-      $("m-prices").textContent = intNum(inv.price_history_files || 0);
-      $("m-trades").textContent = intNum(inv.market_trade_cache_files || 0);
+      $("m-user-trades").textContent = intNum(inv.user_trade_rows || 0);
+      $("m-markets").textContent = intNum(inv.market_metadata_rows || 0);
+      $("m-prices").textContent = intNum(inv.price_history_assets || 0);
+      $("m-trades").textContent = intNum(inv.market_trade_sets || 0);
 
       const running = (data.jobs || []).filter(j => ["queued", "running"].includes(j.status));
       $("job-state").textContent = running.length ? running.length + " active job" + (running.length === 1 ? "" : "s") : "Idle";
       $("run-note").textContent = running.length ? "Background work is running" : "";
 
-      $("runs").innerHTML = sortedRows(data.runs || [], "runs").map(run => {
-        const dur = typeof run.duration_seconds === "number" ? num(run.duration_seconds, 1) + "s" : "";
-        return `<tr><td>${esc(run.name)}</td><td class="${cls(run.status)}">${esc(run.status)}</td><td>${esc(run.started_at)}</td><td class="num">${dur}</td></tr>`;
-      }).join("") || emptyRow(4, "No runs recorded");
-
       $("jobs").innerHTML = sortedRows(data.jobs || [], "jobs").map(job => {
         const cancellable = ["queued", "running"].includes(job.status);
         const cancel = cancellable ? ` <button data-cancel-job="${esc(job.id)}">Cancel</button>` : "";
-        return `<tr><td>${esc(job.label)}</td><td class="${cls(job.status)}">${esc(job.status)}</td><td>${esc(job.created_at)}</td><td><button data-job="${esc(job.id)}">Log</button>${cancel}</td></tr>`;
-      }).join("") || emptyRow(4, "No jobs recorded");
+        const selected = selectedJob === job.id ? " selected" : "";
+        const started = job.started_at || job.created_at || "";
+        return `<tr class="clickable${selected}" data-job-row="${esc(job.id)}">
+          <td title="${esc(started)}">${esc(shortDate(started))}</td>
+          <td title="${esc(job.label)}">${esc(job.label)}</td>
+          <td class="${cls(job.status)}">${esc(job.status)}</td>
+          <td><button data-job="${esc(job.id)}">Log</button>${cancel}</td>
+        </tr>`;
+      }).join("") || emptyRow(4, "No runs recorded");
 
+      document.querySelectorAll("[data-job-row]").forEach(row => {
+        row.onclick = () => selectJob(row.getAttribute("data-job-row"));
+      });
       document.querySelectorAll("[data-job]").forEach(button => {
-        button.onclick = () => selectJob(button.getAttribute("data-job"));
+        button.onclick = (event) => {
+          event.stopPropagation();
+          selectJob(button.getAttribute("data-job"));
+        };
       });
       document.querySelectorAll("[data-cancel-job]").forEach(button => {
-        button.onclick = async () => {
+        button.onclick = async (event) => {
+          event.stopPropagation();
           button.disabled = true;
           try {
             await api("/api/jobs/" + encodeURIComponent(button.getAttribute("data-cancel-job")) + "/cancel", { method: "POST" });
@@ -1929,11 +2505,16 @@ INDEX_HTML = """<!doctype html>
       updateSortIndicators();
     }
     function renderUsers(data) {
-      $("users-count").textContent = intNum(data.count || 0) + " users";
+      const candidateButton = $("candidate-filter");
+      candidateButton.classList.toggle("active", userCandidateOnly);
+      candidateButton.textContent = userCandidateOnly ? "All Users" : "Candidate Users";
+      $("users-count").textContent = intNum(data.count || 0) + (userCandidateOnly ? " candidate users" : " users");
       $("user-total-count").textContent = intNum(data.total_count || 0);
       $("user-shown-count").textContent = intNum(data.count || 0);
-      $("user-cached-count").textContent = intNum(data.cached_user_count || 0);
+      $("user-database-count").textContent = intNum(data.database_user_count || 0);
       $("user-candidate-count").textContent = intNum(data.candidate_count || 0);
+      $("user-shown-candidate-count").textContent = intNum(data.shown_candidate_count || 0);
+      $("update-candidate-users").disabled = !Number(data.candidate_count || 0);
       $("signal-high-users").textContent = intNum(data.high_signal_count || 0);
       $("signal-candidates").textContent = intNum(data.candidate_count || 0);
       $("signal-analyzed").textContent = intNum(data.total_count || 0);
@@ -1941,28 +2522,31 @@ INDEX_HTML = """<!doctype html>
       $("overview-users").innerHTML = overviewRows.slice(0, 8).map(row => {
         const selected = selectedUser === row.user_key ? " selected" : "";
         return `<tr class="clickable${selected}" data-user-key="${esc(row.user_key)}">
-          <td class="num">${scoreCell(row.info_edge_score)}</td>
-          <td title="${esc(row.user_key)}">${userLink(row.user_key, true)}</td>
+          <td class="num">${scoreCell(row.info_edge_score, row.evidence_summary)}</td>
+          <td title="${esc([row.display_name, row.user_key, row.profile_name, row.profile_pseudonym, row.input_user].filter(Boolean).join(' | '))}">${userCell(row, true)}</td>
           <td><span class="pill">${esc(row.info_edge_tier || "Unscored")}</span></td>
           <td class="evidence" title="${esc(row.evidence_summary)}">${esc(row.evidence_summary)}</td>
         </tr>`;
       }).join("") || emptyRow(4, "No user signals yet");
       $("users-table").innerHTML = sortedRows(data.rows || data.top_info_edge || [], "users").map(row => {
         const selected = selectedUser === row.user_key ? " selected" : "";
-        const scanner = row.candidate_confidence ? `<div class="muted">Scanner: ${esc(row.candidate_confidence)} | z ${num(row.candidate_timing_z, 2)} | ${intNum(row.candidate_events)} events</div>` : "";
-        const evidence = `<div class="evidence" title="${esc(row.evidence_summary)}">${esc(row.evidence_summary || "")}</div>${scanner}<div class="muted">${esc(row.source_label || "User")}</div>`;
+        const scannerText = row.candidate_confidence ? `Scanner: ${row.candidate_confidence} | z ${num(row.candidate_timing_z, 2)} | ${intNum(row.candidate_events)} events` : "";
+        const evidenceTitle = [row.evidence_summary, scannerText, row.source_label].filter(Boolean).join(" | ");
+        const edgePerTradeTitle = row.monetized_edge_per_trade_usdc == null ? "Run user analysis to calculate info edge per trade" : `Conservative per-trade monetization: lower of realized PnL/trade and expected edge/trade. ${evidenceTitle}`;
         return `<tr class="clickable${selected}" data-user-key="${esc(row.user_key)}">
-          <td title="${esc(row.user_key)}">${userLink(row.user_key, true)}</td>
-          <td class="num">${scoreCell(row.info_edge_score)}</td>
-          <td><span class="pill">${esc(row.info_edge_tier || "Unscored")}</span></td>
-          <td>${evidence}</td>
+          <td title="${esc([row.display_name, row.user_key, row.profile_name, row.profile_pseudonym, row.input_user].filter(Boolean).join(' | '))}">${userCell(row, true)}</td>
+          <td class="num">${scoreCell(row.info_edge_score, evidenceTitle)}</td>
+          <td><span class="pill" title="${esc(evidenceTitle)}">${esc(row.info_edge_tier || "Unscored")}</span></td>
+          <td class="num" title="${esc(edgePerTradeTitle)}">${money(row.monetized_edge_per_trade_usdc)}</td>
+          <td class="num" title="${esc(scannerText)}">${money(row.candidate_jump_capture, 0)}</td>
+          <td class="num" title="${esc(scannerText)}">${intNum(row.candidate_events)}</td>
           <td class="num">${num(row.skill_index)}</td>
-          <td class="num">${num(row.raw_pnl_usdc)}</td>
+          <td class="num">${money(row.raw_pnl_usdc, 0)}</td>
           <td class="num">${intNum(row.total_trades)}</td>
           <td title="${esc(row.last_updated_at)}">${esc(shortDate(row.last_updated_at))}</td>
-          <td><button class="mini" data-update-user="${esc(row.user_key)}">Update</button></td>
+          <td><button class="mini" data-update-user="${esc(row.user_key)}">Update</button> <button class="mini" data-analyze-user="${esc(row.user_key)}">Analyze</button></td>
         </tr>`;
-      }).join("") || emptyRow(9, "No users yet");
+      }).join("") || emptyRow(11, userCandidateOnly ? "No candidate users matched" : "No users yet");
       document.querySelectorAll("[data-user-key]").forEach(row => {
         row.onclick = () => selectUser(row.getAttribute("data-user-key"));
       });
@@ -1977,6 +2561,17 @@ INDEX_HTML = """<!doctype html>
           }
         };
       });
+      document.querySelectorAll("[data-analyze-user]").forEach(button => {
+        button.onclick = async (event) => {
+          event.stopPropagation();
+          button.disabled = true;
+          try {
+            await startJob("analyze_user", { user_key: button.getAttribute("data-analyze-user") });
+          } finally {
+            button.disabled = false;
+          }
+        };
+      });
       updateSortIndicators();
     }
     function renderTrades(data) {
@@ -1984,12 +2579,13 @@ INDEX_HTML = """<!doctype html>
       const userKey = data && data.user_key ? data.user_key : selectedUser;
       $("trade-title").textContent = userKey ? "Trading History: " + userKey : "Trading History";
       $("update-selected-user").disabled = !userKey;
+      $("analyze-selected-user").disabled = !userKey;
       if (!userKey) {
         $("trade-summary").textContent = "Select a user";
       } else if (data && data.error) {
         $("trade-summary").textContent = data.error;
       } else if (data) {
-        $("trade-summary").textContent = intNum(data.market_count || 0) + " markets, " + intNum(data.matched || 0) + " trades shown of " + intNum(data.total || 0) + " cached trades";
+        $("trade-summary").textContent = intNum(data.market_count || 0) + " markets, " + intNum(data.matched || 0) + " trades shown of " + intNum(data.total || 0) + " database trades";
       }
       $("trades-table").innerHTML = groups.map(group => {
         const marketKey = group.market_key || group.condition_id || group.title;
@@ -2001,6 +2597,7 @@ INDEX_HTML = """<!doctype html>
         return `<tr class="market-row-${esc(status)}">
           <td><button class="expand" data-market-key="${esc(marketKey)}">${buttonLabel}</button></td>
           <td title="${esc(group.title)}">${marketLink(group)}</td>
+          <td class="num">${tradeSignalCell(group)}</td>
           <td><span class="market-status-pill market-status-${esc(status)}">${esc(statusLabel)}</span></td>
           <td title="${esc(group.market_end_date)}">${esc(shortDate(group.market_end_date))}</td>
           <td title="${esc(group.outcome_summary)}">${esc(group.outcome_summary)}</td>
@@ -2012,7 +2609,7 @@ INDEX_HTML = """<!doctype html>
           <td class="num">${closedPnlCell(group)}</td>
           <td>${marketActionButtons(group)}</td>
         </tr>${detail}`;
-      }).join("") || emptyRow(12, selectedUser ? "No cached trades found" : "Select a user to load trades");
+      }).join("") || emptyRow(13, selectedUser ? "No database trades found" : "Select a user to load trades");
       document.querySelectorAll("[data-market-key]").forEach(button => {
         button.onclick = () => {
           const key = button.getAttribute("data-market-key");
@@ -2038,7 +2635,7 @@ INDEX_HTML = """<!doctype html>
           <td>${tx}</td>
         </tr>`;
       }).join("") || `<tr><td colspan="7" class="empty">No fills for this market</td></tr>`;
-      return `<tr class="detail-row"><td colspan="12">
+      return `<tr class="detail-row"><td colspan="13">
         <table class="nested">
           <thead><tr><th>Time</th><th>Side</th><th>Outcome</th><th class="num">Price</th><th class="num">Size</th><th class="num">Notional</th><th>Tx</th></tr></thead>
           <tbody>${body}</tbody>
@@ -2057,9 +2654,25 @@ INDEX_HTML = """<!doctype html>
       const title = (row && row.closed_pnl_note) || "";
       return `<span class="${tone}" title="${esc(title)}">${num(value)}</span>`;
     }
+    function tradeSignalCell(row) {
+      const eventCount = Number(row && row.scanner_user_event_count);
+      const capture = Number(row && row.scanner_user_jump_capture);
+      const score = row ? row.scanner_signal_score : null;
+      if (!Number.isFinite(eventCount) || eventCount <= 0) return "";
+      const captureTone = Number.isFinite(capture) && capture > 0 ? "good" : Number.isFinite(capture) && capture < 0 ? "bad" : "muted";
+      const parts = [
+        "Scanner jump exposure for this selected user/market",
+        Number.isFinite(capture) ? "jump capture " + money(capture, 2) : "",
+        eventCount ? intNum(eventCount) + " event" + (eventCount === 1 ? "" : "s") : "",
+        row.scanner_user_last_jump_time_utc ? "last jump " + row.scanner_user_last_jump_time_utc : "",
+        Number.isFinite(Number(row.scanner_user_max_move)) ? "max move " + num(row.scanner_user_max_move, 3) : "",
+        Number.isFinite(Number(row.scanner_user_avg_directional_ratio)) ? "directional ratio " + num(row.scanner_user_avg_directional_ratio, 2) : ""
+      ].filter(Boolean).join(" | ");
+      return `<div title="${esc(parts)}">${scoreCell(score, parts)}<div class="${captureTone}">${money(capture, 0)}</div><div class="muted">${intNum(eventCount)} evt</div></div>`;
+    }
     function marketActionButtons(row) {
       const id = row.condition_id || "";
-      const updateTitle = "Refresh this market's cached metadata and price history";
+      const updateTitle = "Refresh this market's stored metadata and price history";
       if (!id) return "";
       const update = `<button class="mini" data-update-market="${esc(id)}" title="${esc(updateTitle)}">Update</button>`;
       return update;
@@ -2092,16 +2705,21 @@ INDEX_HTML = """<!doctype html>
     }
     function renderMarkets(data) {
       const rows = sortedRows(data.rows || [], "markets");
-      $("market-count").textContent = intNum(rows.length || 0) + " markets";
-      $("mk-listed").textContent = intNum(rows.length || 0);
-      $("mk-cached").textContent = intNum(data.cached_count || 0);
+      const totalMarkets = Number(data.total_market_count ?? data.listed_count ?? data.count ?? rows.length);
+      const shownMarkets = Number(data.shown_count ?? rows.length);
+      $("market-count").textContent = shownMarkets === totalMarkets
+        ? intNum(totalMarkets || 0) + " markets"
+        : "Showing " + intNum(shownMarkets || 0) + " of " + intNum(totalMarkets || 0) + " markets";
+      $("mk-listed").textContent = intNum(totalMarkets || 0);
+      $("mk-shown").textContent = intNum(shownMarkets || 0);
+      $("mk-database").textContent = intNum(data.database_count || 0);
       $("mk-events").textContent = intNum(data.scanner_event_count || 0);
       $("mk-watermark").textContent = shortDate((data.watermark || {}).updated_at) || "None";
       $("mk-trade-watermark").textContent = shortDate((data.trade_watermark || {}).updated_at) || "None";
       $("mk-analysis-watermark").textContent = shortDate((data.analysis_watermark || {}).updated_at) || "None";
       $("signal-events").textContent = intNum(data.scanner_event_count || 0);
       $("signal-last-analysis").textContent = shortDate((data.analysis_watermark || {}).updated_at) || "None";
-      $("mk-path").textContent = data.market_list_path ? data.market_list_path.split(/[\\\\/]/).pop() : "-";
+      $("mk-added").textContent = intNum(data.added_count || 0);
       $("overview-markets").innerHTML = sortedRows(data.rows || [], "overviewMarkets").filter(row => row.scanner_signal).slice(0, 8).map(row => {
         return `<tr class="market-row-${esc(row.market_status || "unknown")}">
           <td class="num">${scoreCell(row.signal_score)}</td>
@@ -2125,36 +2743,88 @@ INDEX_HTML = """<!doctype html>
       bindMarketUpdateButtons();
       updateSortIndicators();
     }
-    async function refreshStatus(force = false) {
+    async function refreshStatus(force = false, quiet = false) {
       const previousActiveJobs = activeJobCount;
-      state.status = await api("/api/status" + (force ? "?refresh=1" : ""));
-      activeJobCount = (state.status.jobs || []).filter(j => ["queued", "running"].includes(j.status)).length;
-      renderStatus(state.status);
-      if (selectedJob) refreshLog();
-      if (previousActiveJobs > 0 && activeJobCount === 0) {
-        await Promise.all([refreshUsers(), refreshMarkets()]);
-        if (selectedUser) await refreshTrades();
+      if (!quiet) {
+        setLoading("status", true, force ? "Refreshing runs" : "Loading runs");
+        if (!state.status) $("jobs").innerHTML = loadingRow(4, "Loading runs");
+        await nextFrame();
+      }
+      try {
+        state.status = await api("/api/status" + (force ? "?refresh=1" : ""));
+        activeJobCount = (state.status.jobs || []).filter(j => ["queued", "running"].includes(j.status)).length;
+        renderStatus(state.status);
+        if (selectedJob) refreshLog(quiet);
+        if (previousActiveJobs > 0 && activeJobCount === 0) {
+          await Promise.all([refreshUsers(), refreshMarkets()]);
+          if (selectedUser) await refreshTrades();
+        }
+      } catch (error) {
+        if (!quiet) {
+          $("jobs").innerHTML = errorRow(4, error, "Unable to load runs");
+          $("job-state").textContent = "Run load failed";
+        }
+      } finally {
+        if (!quiet) setLoading("status", false);
       }
     }
     async function refreshUsers() {
       const query = $("user-search").value.trim();
-      state.users = await api("/api/users?q=" + encodeURIComponent(query));
-      renderUsers(state.users);
+      const params = new URLSearchParams({ q: query, limit: "1000" });
+      if (userCandidateOnly) params.set("candidates", "1");
+      const label = userCandidateOnly ? "Loading candidate users" : "Loading users";
+      setLoading("users", true, label);
+      if (!state.users) {
+        $("users-count").textContent = label;
+        $("overview-users").innerHTML = loadingRow(4, label);
+        $("users-table").innerHTML = loadingRow(11, label);
+      }
+      await nextFrame();
+      try {
+        state.users = await api("/api/users?" + params.toString());
+        renderUsers(state.users);
+      } catch (error) {
+        $("overview-users").innerHTML = errorRow(4, error, "Unable to load users");
+        $("users-table").innerHTML = errorRow(11, error, "Unable to load users");
+      } finally {
+        setLoading("users", false);
+      }
     }
     async function refreshMarkets() {
       const query = $("market-search") ? $("market-search").value.trim() : "";
-      state.markets = await api("/api/markets?q=" + encodeURIComponent(query));
-      renderMarkets(state.markets);
+      const label = "Loading markets";
+      setLoading("markets", true, label);
+      if (!state.markets) {
+        $("market-count").textContent = label;
+        $("overview-markets").innerHTML = loadingRow(4, label);
+        $("markets-table").innerHTML = loadingRow(8, label);
+      }
+      await nextFrame();
+      try {
+        state.markets = await api("/api/markets?q=" + encodeURIComponent(query));
+        renderMarkets(state.markets);
+      } catch (error) {
+        $("overview-markets").innerHTML = errorRow(4, error, "Unable to load markets");
+        $("markets-table").innerHTML = errorRow(8, error, "Unable to load markets");
+      } finally {
+        setLoading("markets", false);
+      }
     }
     async function addMarket(marketId, source = "manual") {
       const id = String(marketId || "").trim();
       if (!id) return;
-      state.markets = await api("/api/markets", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({ market_id: id, source })
-      });
-      renderMarkets(state.markets);
+      setLoading("markets", true, "Adding market");
+      await nextFrame();
+      try {
+        state.markets = await api("/api/markets", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({ market_id: id, source })
+        });
+        renderMarkets(state.markets);
+      } finally {
+        setLoading("markets", false);
+      }
     }
     async function selectUser(userKey) {
       if (!userKey) return;
@@ -2163,10 +2833,9 @@ INDEX_HTML = """<!doctype html>
       setTab("users");
       renderUsers(state.users || {});
       $("trade-title").textContent = "Trading History: " + userKey;
-      $("trade-summary").textContent = "Loading cached trades";
-      $("trades-table").innerHTML = emptyRow(12, "Loading cached trades");
       await refreshTrades();
       $("update-selected-user").disabled = false;
+      $("analyze-selected-user").disabled = false;
     }
     async function refreshTrades() {
       if (!selectedUser) {
@@ -2174,8 +2843,19 @@ INDEX_HTML = """<!doctype html>
         return;
       }
       const query = $("trade-search").value.trim();
-      state.trades = await api("/api/users/" + encodeURIComponent(selectedUser) + "/trades?limit=1000&q=" + encodeURIComponent(query));
-      renderTrades(state.trades);
+      setLoading("trades", true, "Loading trades");
+      $("trade-summary").textContent = "Loading trades";
+      $("trades-table").innerHTML = loadingRow(13, "Loading trades");
+      await nextFrame();
+      try {
+        state.trades = await api("/api/users/" + encodeURIComponent(selectedUser) + "/trades?limit=1000&q=" + encodeURIComponent(query));
+        renderTrades(state.trades);
+      } catch (error) {
+        $("trade-summary").textContent = "Trade load failed";
+        $("trades-table").innerHTML = errorRow(13, error, "Unable to load trades");
+      } finally {
+        setLoading("trades", false);
+      }
     }
     async function refreshAll(force = false) {
       await Promise.all([refreshStatus(force), refreshUsers(), refreshMarkets()]);
@@ -2184,13 +2864,25 @@ INDEX_HTML = """<!doctype html>
       selectedJob = id;
       $("log-title").textContent = id;
       setTab("jobs");
+      if (state.status) renderStatus(state.status);
       await refreshLog();
     }
-    async function refreshLog() {
+    async function refreshLog(quiet = false) {
       if (!selectedJob) return;
-      const data = await api("/api/jobs/" + encodeURIComponent(selectedJob) + "/log");
-      $("log").textContent = data.log || "";
-      $("log").scrollTop = $("log").scrollHeight;
+      if (!quiet) {
+        setLoading("log", true, "Loading log");
+        $("log").textContent = "Loading log...";
+        await nextFrame();
+      }
+      try {
+        const data = await api("/api/jobs/" + encodeURIComponent(selectedJob) + "/log");
+        $("log").textContent = data.log || "";
+        $("log").scrollTop = $("log").scrollHeight;
+      } catch (error) {
+        $("log").textContent = String(error);
+      } finally {
+        if (!quiet) setLoading("log", false);
+      }
     }
     async function startJob(action, params = {}) {
       const data = await api("/api/jobs", {
@@ -2205,6 +2897,11 @@ INDEX_HTML = """<!doctype html>
     document.querySelectorAll(".tab").forEach(button => {
       button.onclick = () => setTab(button.dataset.tab);
     });
+    const themeButton = $("theme-toggle");
+    if (themeButton) {
+      applyTheme(themeName());
+      themeButton.onclick = () => applyTheme(themeName() === "dark" ? "light" : "dark");
+    }
     document.querySelectorAll("th.sortable").forEach(th => {
       th.onclick = () => {
         const tableName = th.dataset.sortTable;
@@ -2236,7 +2933,8 @@ INDEX_HTML = """<!doctype html>
         }
       };
     });
-    $("refresh").onclick = () => refreshAll(true);
+    const refreshButton = $("refresh");
+    if (refreshButton) refreshButton.onclick = () => refreshAll(true);
     $("add-market").onclick = async () => {
       const input = $("market-id-input");
       const value = input.value.trim();
@@ -2253,15 +2951,38 @@ INDEX_HTML = """<!doctype html>
       if (event.key === "Enter") $("add-market").click();
     };
     $("user-search").oninput = () => refreshUsers();
+    $("candidate-filter").onclick = () => {
+      userCandidateOnly = !userCandidateOnly;
+      refreshUsers();
+    };
+    $("update-user-input").onclick = async () => {
+      const input = $("user-id-input");
+      const value = input.value.trim();
+      if (!value) return;
+      try {
+        await startJob("update_user", { user_key: value });
+        input.value = "";
+      } catch (error) {
+        $("log").textContent = String(error);
+        setTab("jobs");
+      }
+    };
+    $("user-id-input").onkeydown = (event) => {
+      if (event.key === "Enter") $("update-user-input").click();
+    };
     $("trade-search").oninput = () => refreshTrades();
     $("market-search").oninput = () => refreshMarkets();
     $("update-selected-user").onclick = async () => {
       if (!selectedUser) return;
       await startJob("update_user", { user_key: selectedUser });
     };
+    $("analyze-selected-user").onclick = async () => {
+      if (!selectedUser) return;
+      await startJob("analyze_user", { user_key: selectedUser });
+    };
     renderTrades(null);
     refreshAll(false);
-    setInterval(() => refreshStatus(false), 5000);
+    setInterval(() => refreshStatus(false, true), 5000);
   </script>
 </body>
 </html>
@@ -2292,10 +3013,6 @@ def _text_response(handler: BaseHTTPRequestHandler, body: str, content_type: str
     _send_response(handler, data, f"{content_type}; charset=utf-8")
 
 
-def _bytes_response(handler: BaseHTTPRequestHandler, body: bytes, content_type: str) -> None:
-    _send_response(handler, body, content_type)
-
-
 def build_job_command(
     action: str,
     body: Dict[str, Any],
@@ -2308,12 +3025,40 @@ def build_job_command(
 
     if action == "update_user":
         raw_user_key = str(body.get("user_key") or "").strip()
-        user_key = safe_user_key(raw_user_key)
-        if not user_key or user_key != raw_user_key:
+        user_key = clean_user_identifier(raw_user_key)
+        if not user_key:
             raise ValueError("user_key is required")
         return (
             f"Update and analyze user {user_key}",
             app_command("update", "users", "--user", user_key, "--skip-price-history", "--analyze-after"),
+        )
+
+    if action == "analyze_user":
+        raw_user_key = str(body.get("user_key") or "").strip()
+        user_key = clean_user_identifier(raw_user_key)
+        if not user_key:
+            raise ValueError("user_key is required")
+        return (
+            f"Analyze user {user_key}",
+            app_command("analyze", "luck", "--user", user_key),
+        )
+
+    if action == "update_candidate_users":
+        user_keys = scanner_candidate_user_keys(reports_dir, data_dir=data_dir)
+        if not user_keys:
+            raise ValueError("no scanner candidate users found; run Analyze Markets first")
+        users_file = write_user_keys_file(user_keys, ROOT, prefix="candidate_users")
+        return (
+            f"Update and analyze {len(user_keys)} candidate users",
+            app_command(
+                "update",
+                "users",
+                "--users-file",
+                str(users_file),
+                "--skip-price-history",
+                "--analyze-after",
+                "--no-seed-from-candidates",
+            ),
         )
 
     if action == "update_market":
@@ -2446,14 +3191,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     cache_seconds=0 if force else 60,
                 ),
                 "runs": list_latest_runs(ROOT),
-                "jobs": list_jobs(ROOT, limit=12),
+                "jobs": list_jobs(ROOT, limit=50),
                 "watermarks": load_watermarks(self.data_dir),
             }
             _json_response(self, payload)
             return
         if parsed.path == "/api/users":
             query = str((params.get("q") or [""])[0])
-            _json_response(self, load_user_analysis(self.data_dir, self.reports_dir, query=query))
+            limit = safe_int((params.get("limit") or ["200"])[0]) or 200
+            candidate_only = (params.get("candidates") or ["0"])[0] in {"1", "true", "yes"}
+            _json_response(
+                self,
+                load_user_analysis(
+                    self.data_dir,
+                    self.reports_dir,
+                    query=query,
+                    limit=limit,
+                    candidate_only=candidate_only,
+                ),
+            )
             return
         if parsed.path.startswith("/api/users/") and parsed.path.endswith("/trades"):
             raw_user = parsed.path[len("/api/users/") : -len("/trades")]
@@ -2463,6 +3219,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             payload = load_user_trade_history(
                 self.data_dir,
                 user_key,
+                reports_dir=self.reports_dir,
                 query=query,
                 limit=limit,
             )
@@ -2471,7 +3228,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/scanner":
             query = str((params.get("q") or [""])[0])
-            _json_response(self, load_scanner(self.reports_dir, query=query))
+            _json_response(self, load_scanner(self.reports_dir, query=query, data_dir=self.data_dir))
             return
         if parsed.path == "/api/markets":
             query = str((params.get("q") or [""])[0])
@@ -2489,20 +3246,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if log_path.exists():
                 log = log_path.read_text(encoding="utf-8", errors="replace")[-120_000:]
             _json_response(self, {"id": safe_id, "log": log})
-            return
-        if parsed.path == "/static/user-dashboard":
-            path = Path(self.reports_dir) / "dashboard.html"
-            if path.exists():
-                _bytes_response(self, static_file_payload(path), "text/html; charset=utf-8")
-                return
-            _text_response(self, "<p>User dashboard has not been built.</p>")
-            return
-        if parsed.path == "/static/market-dashboard":
-            path = Path(self.reports_dir) / "market_scanner_dashboard.html"
-            if path.exists():
-                _bytes_response(self, static_file_payload(path), "text/html; charset=utf-8")
-                return
-            _text_response(self, "<p>Scanner dashboard has not been built.</p>")
             return
         _json_response(self, {"error": "not found"}, status=404)
 

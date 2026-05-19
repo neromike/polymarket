@@ -70,10 +70,14 @@ def update_users_command(args: argparse.Namespace) -> List[str]:
     command = [sys.executable, script("download_data.py")]
     add_option(command, "--data-dir", args.data_dir)
     add_repeated(command, "--user", args.user)
+    add_repeated(command, "--users-file", args.users_file)
     add_option(command, "--sleep", args.sleep)
+    add_option(command, "--timeout-seconds", args.timeout_seconds)
+    add_option(command, "--max-retries", args.max_retries)
+    add_option(command, "--trades-page-limit", args.trades_page_limit)
+    add_option(command, "--trades-max-offset", args.trades_max_offset)
     add_option(command, "--price-fidelity-minutes", args.price_fidelity_minutes)
     add_option(command, "--max-price-window-days", args.max_price_window_days)
-    add_option(command, "--candidates-csv", args.candidates_csv)
     add_option(command, "--candidate-confidences", args.candidate_confidences)
     add_flag(command, "--skip-price-history", args.skip_price_history)
     add_flag(command, "--force-trades-refresh", args.force_trades_refresh)
@@ -106,7 +110,6 @@ def update_markets_command(args: argparse.Namespace) -> List[str]:
 def update_market_trades_command(args: argparse.Namespace) -> List[str]:
     command = [sys.executable, script("market_scanner.py"), "--cache-trades-only", "--allow-api"]
     add_option(command, "--data-dir", args.data_dir)
-    add_option(command, "--market-trades-cache-dir", args.market_trades_cache_dir)
     add_option(command, "--max-markets", args.max_markets)
     add_repeated(command, "--market", args.market)
     add_option(command, "--markets-file", args.markets_file)
@@ -122,6 +125,7 @@ def analyze_luck_command(args: argparse.Namespace) -> List[str]:
     add_option(command, "--data-dir", args.data_dir)
     add_option(command, "--reports-dir", args.reports_dir)
     add_repeated(command, "--user", args.user)
+    add_repeated(command, "--users-file", args.users_file)
     add_option(command, "--sleep", args.sleep)
     add_flag(command, "--hydrate-missing-users", args.hydrate_missing_users)
     add_flag(command, "--use-price-history", args.use_price_history)
@@ -142,7 +146,6 @@ def analyze_scanner_command(args: argparse.Namespace) -> List[str]:
     add_option(command, "--max-markets", args.max_markets)
     add_repeated(command, "--market", args.market)
     add_option(command, "--markets-file", args.markets_file)
-    add_option(command, "--market-trades-cache-dir", args.market_trades_cache_dir)
     add_option(command, "--event-cluster-window", args.event_cluster_window)
     add_option(command, "--min-independent-events", args.min_independent_events)
     add_option(command, "--max-single-event-share", args.max_single_event_share)
@@ -161,34 +164,13 @@ def scanner_analysis_command(
     market: Iterable[str] | None = None,
     markets_file: str | None = None,
     out_dir: str = "reports/market_scanner",
-    market_trades_cache_dir: str = "market/trades",
 ) -> List[str]:
     command = [sys.executable, script("market_scanner.py")]
     add_option(command, "--data-dir", data_dir)
     add_option(command, "--out-dir", out_dir)
     add_repeated(command, "--market", market)
     add_option(command, "--markets-file", markets_file)
-    add_option(command, "--market-trades-cache-dir", market_trades_cache_dir)
     return command
-
-
-def dashboard_build_commands(args: argparse.Namespace) -> List[List[str]]:
-    commands: List[List[str]] = []
-    if args.which in {"all", "user"}:
-        user_command = [sys.executable, script("dashboard_user.py")]
-        add_option(user_command, "--data-dir", args.data_dir)
-        add_option(user_command, "--report-users-dir", args.report_users_dir)
-        add_option(user_command, "--out", args.user_out)
-        commands.append(user_command)
-    if args.which in {"all", "market"}:
-        market_command = [sys.executable, script("dashboard_market.py")]
-        add_option(market_command, "--input-dir", args.market_input_dir)
-        add_option(market_command, "--data-dir", args.data_dir)
-        add_option(market_command, "--out", args.market_out)
-        add_option(market_command, "--max-wallet-events", args.max_wallet_events)
-        add_option(market_command, "--max-event-wallets", args.max_event_wallets)
-        commands.append(market_command)
-    return commands
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -199,11 +181,9 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     print("Inventory")
     print(f"  users: {inventory.get('user_count', 0)}")
-    print(f"  user trade files: {inventory.get('user_trade_files', 0)}")
-    print(f"  market metadata files: {inventory.get('market_metadata_files', 0)}")
-    print(f"  price history files: {inventory.get('price_history_files', 0)}")
-    print(f"  market trade cache files: {inventory.get('market_trade_cache_files', 0)}")
-    print(f"  total csv files indexed: {inventory.get('total_data_csv_files', 0)}")
+    print(f"  market metadata rows: {inventory.get('market_metadata_rows', 0)}")
+    print(f"  price history assets: {inventory.get('price_history_assets', 0)}")
+    print(f"  market trade sets: {inventory.get('market_trade_sets', 0)}")
     print(f"  generated: {inventory.get('generated_at', 'unknown')}")
 
     print("\nLatest runs")
@@ -230,38 +210,67 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_db_status(args: argparse.Namespace) -> int:
+    from sqlite_store import database_summary, default_db_path, ensure_database
+
+    db_path = args.db_path or str(default_db_path(args.data_dir))
+    ensure_database(args.data_dir, db_path)
+    summary = database_summary(db_path)
+    print(f"SQLite database: {summary['db_path']}")
+    if not summary.get("exists"):
+        print("  not built")
+        return 1
+    meta = summary.get("meta", {})
+    if meta.get("built_at"):
+        print(f"  built_at: {meta['built_at']}")
+    for name, count in sorted(summary.get("counts", {}).items()):
+        print(f"  {name}: {count}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Polymarket local data app: update caches, run offline analysis, and build dashboards."
+        description="Polymarket local data app: update local SQL data, run offline analysis, and serve dashboards."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    status = subparsers.add_parser("status", help="Show cache/report freshness and recent runs")
+    status = subparsers.add_parser("status", help="Show database/report freshness and recent runs")
     status.add_argument("--data-dir", default="data")
     status.add_argument("--reports-dir", default="reports")
-    status.add_argument("--refresh", action="store_true", help="Recompute inventory instead of using cache")
+    status.add_argument("--refresh", action="store_true", help="Recompute inventory instead of using the saved snapshot")
 
-    update = subparsers.add_parser("update", help="Run API-backed cache updates")
+    db = subparsers.add_parser("db", help="Inspect the local SQLite database")
+    db_sub = db.add_subparsers(dest="target", required=True)
+
+    db_status = db_sub.add_parser("status", help="Show SQLite table counts")
+    db_status.add_argument("--data-dir", default="data")
+    db_status.add_argument("--db-path")
+
+    update = subparsers.add_parser("update", help="Run API-backed database updates")
     update_sub = update.add_subparsers(dest="target", required=True)
 
     users = update_sub.add_parser("users", help="Refresh user trades, market metadata, and price history")
     users.add_argument("--data-dir", default="data")
     users.add_argument("--user", action="append")
+    users.add_argument("--users-file", action="append", help="Text file of user keys or wallets, one per line")
     users.add_argument("--sleep", type=float, default=0.05)
+    users.add_argument("--timeout-seconds", type=int, default=30)
+    users.add_argument("--max-retries", type=int, default=5)
+    users.add_argument("--trades-page-limit", type=int, default=500)
+    users.add_argument("--trades-max-offset", type=int, default=3000)
     users.add_argument("--price-fidelity-minutes", type=int, default=60)
     users.add_argument("--max-price-window-days", type=int, default=7)
     users.add_argument("--skip-price-history", action="store_true")
     users.add_argument("--force-trades-refresh", action="store_true")
     users.add_argument("--force-market-refresh", action="store_true")
     users.add_argument("--force-price-refresh", action="store_true")
-    users.add_argument("--candidates-csv", default="reports/market_scanner/candidate_users.csv")
     users.add_argument("--candidate-confidences", default="high,very_high")
     users.add_argument("--no-seed-from-candidates", action="store_true")
     users.add_argument("--analyze-after", action="store_true")
     users.add_argument("--analysis-reports-dir", default="reports/luck_skill")
     users.add_argument("--analysis-use-price-history", action="store_true")
 
-    markets = update_sub.add_parser("markets", help="Discover/cache high-signal markets and price history")
+    markets = update_sub.add_parser("markets", help="Discover/store high-signal markets and price history")
     markets.add_argument("--data-dir", default="data")
     markets.add_argument("--limit-pages", type=int, default=10)
     markets.add_argument("--page-size", type=int, default=500)
@@ -279,11 +288,9 @@ def build_parser() -> argparse.ArgumentParser:
     markets.add_argument("--force-price-refresh", action="store_true")
     markets.add_argument("--analyze-after", action="store_true")
     markets.add_argument("--scanner-out-dir", default="reports/market_scanner")
-    markets.add_argument("--market-trades-cache-dir", default="market/trades")
 
-    market_trades = update_sub.add_parser("market-trades", help="Refresh scanner market-trade caches")
+    market_trades = update_sub.add_parser("market-trades", help="Refresh scanner market-trade rows")
     market_trades.add_argument("--data-dir", default="data")
-    market_trades.add_argument("--market-trades-cache-dir", default="market/trades")
     market_trades.add_argument("--max-markets", type=int, default=0)
     market_trades.add_argument("--market", action="append")
     market_trades.add_argument("--markets-file")
@@ -294,18 +301,19 @@ def build_parser() -> argparse.ArgumentParser:
     market_trades.add_argument("--analyze-after", action="store_true")
     market_trades.add_argument("--scanner-out-dir", default="reports/market_scanner")
 
-    analyze = subparsers.add_parser("analyze", help="Run cache-backed analysis")
+    analyze = subparsers.add_parser("analyze", help="Run database-backed analysis")
     analyze_sub = analyze.add_subparsers(dest="target", required=True)
 
-    luck = analyze_sub.add_parser("luck", help="Run luck/skill analysis from cached data")
+    luck = analyze_sub.add_parser("luck", help="Run luck/skill analysis from local SQL data")
     luck.add_argument("--data-dir", default="data")
     luck.add_argument("--reports-dir", default="reports/luck_skill")
     luck.add_argument("--user", action="append")
+    luck.add_argument("--users-file", action="append", help="Text file of user keys, one per line")
     luck.add_argument("--hydrate-missing-users", action="store_true")
     luck.add_argument("--use-price-history", action="store_true")
     luck.add_argument("--sleep", type=float, default=0.05)
 
-    scanner = analyze_sub.add_parser("scanner", help="Run market scanner from cached data by default")
+    scanner = analyze_sub.add_parser("scanner", help="Run market scanner from local SQL data by default")
     scanner.add_argument("--data-dir", default="data")
     scanner.add_argument("--out-dir", default="reports/market_scanner")
     scanner.add_argument("--lookback-windows", default="15m,1h,6h,24h,7d")
@@ -318,7 +326,6 @@ def build_parser() -> argparse.ArgumentParser:
     scanner.add_argument("--max-markets", type=int, default=0)
     scanner.add_argument("--market", action="append")
     scanner.add_argument("--markets-file")
-    scanner.add_argument("--market-trades-cache-dir", default="market/trades")
     scanner.add_argument("--event-cluster-window", default="24h")
     scanner.add_argument("--min-independent-events", type=int, default=2)
     scanner.add_argument("--max-single-event-share", type=float, default=0.65)
@@ -331,16 +338,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     dashboard = subparsers.add_parser("dashboard", help="Build or serve dashboards")
     dashboard_sub = dashboard.add_subparsers(dest="target", required=True)
-
-    build = dashboard_sub.add_parser("build", help="Build static dashboard HTML files")
-    build.add_argument("--which", choices=("all", "user", "market"), default="all")
-    build.add_argument("--data-dir", default="data")
-    build.add_argument("--report-users-dir", default="reports/luck_skill/users")
-    build.add_argument("--user-out", default="reports/dashboard.html")
-    build.add_argument("--market-input-dir", default="reports/market_scanner")
-    build.add_argument("--market-out", default="reports/market_scanner_dashboard.html")
-    build.add_argument("--max-wallet-events", type=int, default=120)
-    build.add_argument("--max-event-wallets", type=int, default=40)
 
     serve = dashboard_sub.add_parser("serve", help="Serve a local dashboard/job control panel")
     serve.add_argument("--host", default="127.0.0.1")
@@ -358,6 +355,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "status":
         return cmd_status(args)
 
+    if args.command == "db":
+        if args.target == "status":
+            return cmd_db_status(args)
+
     if args.command == "update":
         if args.target == "users":
             command = update_users_command(args)
@@ -372,6 +373,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.analysis_reports_dir,
                 ]
                 add_repeated(analyze_command, "--user", args.user)
+                add_repeated(analyze_command, "--users-file", args.users_file)
                 add_option(analyze_command, "--sleep", args.sleep)
                 add_flag(analyze_command, "--use-price-history", args.analysis_use_price_history)
                 commands.append(analyze_command)
@@ -391,7 +393,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                         market=args.market,
                         markets_file=args.markets_file,
                         out_dir=args.scanner_out_dir,
-                        market_trades_cache_dir=args.market_trades_cache_dir,
                     )
                 )
             return run_steps(
@@ -410,7 +411,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                         market=args.market,
                         markets_file=args.markets_file,
                         out_dir=args.scanner_out_dir,
-                        market_trades_cache_dir=args.market_trades_cache_dir,
                     )
                 )
             return run_steps(
@@ -434,9 +434,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
 
     if args.command == "dashboard":
-        if args.target == "build":
-            commands = dashboard_build_commands(args)
-            return run_steps(name="dashboard_build", kind="dashboard", commands=commands)
         if args.target == "serve":
             from dashboard_server import serve_dashboard
 

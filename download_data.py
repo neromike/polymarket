@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
-import json
 import re
 import sys
 from collections import defaultdict
@@ -10,10 +8,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, DefaultDict, Dict, Iterable, List, Sequence, Set, Tuple
 
-from api import ApiError, MetadataCache, PolymarketClient, fetch_paginated, resolve_user_to_wallet
-from cli import write_csv
+from api import ApiError, MetadataCache, PolymarketClient, resolve_user_to_wallet
 from config import CLOB_BASE, DATA_BASE, AnalyzerConfig
 from runtime_state import update_watermark
+from sqlite_store import (
+    candidate_wallets as sqlite_candidate_wallets,
+    ensure_database,
+    list_user_keys as sqlite_list_user_keys,
+    load_all_user_trades as sqlite_load_all_user_trades,
+    load_user_trade_uids as sqlite_load_user_trade_uids,
+    load_user_profile_row as sqlite_load_user_profile_row,
+    market_condition_ids as sqlite_market_condition_ids,
+    price_history_cached as sqlite_price_history_cached,
+    upsert_user_alias as sqlite_upsert_user_alias,
+    upsert_markets as sqlite_upsert_markets,
+    upsert_price_history as sqlite_upsert_price_history,
+    upsert_user_profile as sqlite_upsert_user_profile,
+    upsert_user_trades as sqlite_upsert_user_trades,
+)
 from utils import safe_float
 
 
@@ -23,7 +35,7 @@ USER_KEY_RE = re.compile(r"[^a-z0-9._-]+")
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Download Polymarket user trade data and related market data into monthly CSV partitions."
+            "Download Polymarket user trade data and related market data into SQLite."
         )
     )
     parser.add_argument(
@@ -31,19 +43,48 @@ def parse_args() -> argparse.Namespace:
         action="append",
         help=(
             "Polymarket handle or proxy wallet. Repeatable. "
-            "If omitted, users are discovered from subfolders under <data-dir>/user."
+            "If omitted, users are selected from the local database."
         ),
+    )
+    parser.add_argument(
+        "--users-file",
+        action="append",
+        help="Text file containing Polymarket handles or proxy wallets, one per line.",
     )
     parser.add_argument(
         "--data-dir",
         default="data",
-        help="Root directory for downloaded CSV files. Defaults to ./data",
+        help="Root directory for the SQLite database. Defaults to ./data",
     )
     parser.add_argument(
         "--sleep",
         type=float,
         default=0.05,
         help="Seconds to sleep between API calls.",
+    )
+    parser.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=30,
+        help="HTTP timeout per API request.",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=5,
+        help="Maximum HTTP retry attempts before a request is treated as failed.",
+    )
+    parser.add_argument(
+        "--trades-page-limit",
+        type=int,
+        default=500,
+        help="Number of user trades requested per /trades page.",
+    )
+    parser.add_argument(
+        "--trades-max-offset",
+        type=int,
+        default=3_000,
+        help="Maximum /trades pagination offset to fetch per user.",
     )
     parser.add_argument(
         "--price-fidelity-minutes",
@@ -65,38 +106,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--force-trades-refresh",
         action="store_true",
-        help="Always fetch user trades from API even if cached trade files exist.",
+        help="Always fetch user trades from API even if rows already exist.",
     )
     parser.add_argument(
         "--force-market-refresh",
         action="store_true",
-        help="Always fetch and rewrite market metadata files.",
+        help="Always fetch and rewrite market metadata rows.",
     )
     parser.add_argument(
         "--force-price-refresh",
         action="store_true",
-        help="Always refetch and rewrite price-history files.",
-    )
-    parser.add_argument(
-        "--candidates-csv",
-        default="reports/market_scanner/candidate_users.csv",
-        help=(
-            "Scanner output CSV used to auto-seed users when --user is omitted "
-            "(default: reports/market_scanner/candidate_users.csv)"
-        ),
+        help="Always refetch and rewrite price-history rows.",
     )
     parser.add_argument(
         "--candidate-confidences",
         default="high,very_high",
-        help=(
-            "Comma-separated confidence levels to auto-seed from candidates CSV "
-            "(default: high,very_high)"
-        ),
+        help="Comma-separated confidence levels to auto-select from scanner candidates.",
     )
     parser.add_argument(
         "--no-seed-from-candidates",
         action="store_true",
-        help="Disable automatic seeding of data/user folders from scanner candidates CSV.",
+        help="Disable automatic selection from scanner candidates.",
     )
     return parser.parse_args()
 
@@ -105,6 +135,15 @@ def user_key(value: str) -> str:
     s = value.strip().lstrip("@").lower()
     s = USER_KEY_RE.sub("_", s)
     return s or "unknown_user"
+
+
+def wallet_like(value: Any) -> bool:
+    return bool(re.fullmatch(r"0x[a-fA-F0-9]{40}", str(value or "").strip()))
+
+
+def non_wallet_text(value: Any) -> str:
+    text = str(value or "").strip()
+    return "" if wallet_like(text) else text
 
 
 def to_unix_seconds(ts: Any) -> float | None:
@@ -124,115 +163,44 @@ def month_key_from_ts(ts: Any) -> str | None:
     return dt.strftime("%Y-%m")
 
 
-def csv_safe(value: Any) -> Any:
-    if isinstance(value, (list, dict)):
-        return json.dumps(value, separators=(",", ":"), sort_keys=False)
-    return value
-
-
-def csv_safe_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    return {key: csv_safe(value) for key, value in row.items()}
-
-
-def sanitize_file_component(value: Any, fallback: str = "row") -> str:
-    text = str(value or "").strip()
-    if not text:
-        text = fallback
-    text = USER_KEY_RE.sub("_", text.lower())
-    text = text.strip("._")
-    if not text:
-        text = fallback
-    return text[:140]
-
-
 def parse_confidence_levels(value: str) -> Set[str]:
     levels = {x.strip().lower() for x in str(value or "").split(",") if x.strip()}
     return levels or {"high", "very_high"}
 
 
-def load_candidate_wallets(candidates_csv: Path, accepted_confidences: Set[str]) -> List[str]:
-    if not candidates_csv.exists():
-        return []
-
-    wallets: List[str] = []
-    seen: Set[str] = set()
+def load_users_file(path: Path) -> List[str]:
+    users: List[str] = []
     try:
-        with candidates_csv.open("r", newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                confidence = str(row.get("confidence_level") or "").strip().lower()
-                if confidence not in accepted_confidences:
-                    continue
-                wallet = str(row.get("wallet") or "").strip()
-                if not wallet:
-                    continue
-                wallet_l = wallet.lower()
-                if wallet_l in seen:
-                    continue
-                seen.add(wallet_l)
-                wallets.append(wallet)
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                value = line.strip()
+                if value and not value.startswith("#"):
+                    users.append(value)
     except OSError as exc:
-        print(f"Failed reading candidates CSV {candidates_csv}: {exc}", file=sys.stderr)
-        return []
-
-    return wallets
+        print(f"Failed reading users file {path}: {exc}", file=sys.stderr)
+    return users
 
 
-def seed_user_dirs_from_candidates(
-    data_dir: Path,
-    candidates_csv: Path,
-    accepted_confidences: Set[str],
-) -> Tuple[int, int]:
-    wallets = load_candidate_wallets(candidates_csv, accepted_confidences)
-    if not wallets:
-        return 0, 0
+def collect_requested_users(users: Sequence[str] | None, users_files: Sequence[str] | None) -> List[str]:
+    requested: List[str] = []
+    seen: Set[str] = set()
 
-    users_dir = data_dir / "user"
-    users_dir.mkdir(parents=True, exist_ok=True)
+    def add(value: Any) -> None:
+        text = str(value or "").strip()
+        if not text:
+            return
+        key = text.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        requested.append(text)
 
-    created = 0
-    existing = 0
-    for wallet in wallets:
-        folder = users_dir / sanitize_file_component(wallet, fallback="wallet")
-        if folder.exists():
-            existing += 1
-            continue
-        folder.mkdir(parents=True, exist_ok=True)
-        created += 1
-
-    return created, existing
-
-
-def build_record_key(row: Dict[str, Any], key_fields: Sequence[str], idx: int) -> str:
-    for field in key_fields:
-        value = row.get(field)
-        if value is not None and str(value).strip():
-            return sanitize_file_component(value, fallback=f"{idx:08d}")
-    return f"{idx:08d}"
-
-
-def record_file_path(base_dir: Path, month: str, prefix: str, record_key: str) -> Path:
-    return base_dir / month / f"{prefix}_{record_key}.csv"
-
-
-def write_monthly_record_files(
-    base_dir: Path,
-    rows_by_month: Dict[str, List[Dict[str, Any]]],
-    *,
-    prefix: str,
-    key_fields: Sequence[str],
-    overwrite: bool,
-) -> int:
-    written = 0
-    for month, rows in sorted(rows_by_month.items()):
-        for idx, row in enumerate(rows, start=1):
-            record_key = build_record_key(row, key_fields, idx)
-            out_path = record_file_path(base_dir, month, prefix, record_key)
-            if out_path.exists() and not overwrite:
-                continue
-            write_csv(out_path, [csv_safe_row(row)])
-            written += 1
-    return written
+    for user in users or []:
+        add(user)
+    for users_file in users_files or []:
+        for user in load_users_file(Path(users_file)):
+            add(user)
+    return requested
 
 
 def trade_uid(trade: Dict[str, Any]) -> str:
@@ -256,39 +224,129 @@ def trade_uid(trade: Dict[str, Any]) -> str:
 
 
 def load_existing_trade_uids(data_dir: Path, key: str) -> Set[str]:
-    """Load trade UIDs from existing cached trade files."""
-    base_dir = data_dir / "user" / key / "trades"
-    if not base_dir.exists():
-        return set()
-
-    uids: Set[str] = set()
-    for month_dir in sorted([p for p in base_dir.iterdir() if p.is_dir()]):
-        for csv_file in sorted(month_dir.glob("trade_*.csv")):
-            try:
-                with csv_file.open("r", newline="", encoding="utf-8") as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        uid = trade_uid(row)
-                        if uid:
-                            uids.add(uid)
-            except OSError:
-                continue
-    return uids
+    """Load trade UIDs from SQLite."""
+    return sqlite_load_user_trade_uids(data_dir, key)
 
 
-def load_cached_trade_rows(data_dir: Path, key: str) -> List[Dict[str, Any]]:
-    base_dir = data_dir / "user" / key / "trades"
-    if not base_dir.exists():
-        return []
+def load_stored_trade_rows(data_dir: Path, key: str) -> List[Dict[str, Any]]:
+    return sqlite_load_all_user_trades(data_dir, key)
 
-    rows: List[Dict[str, Any]] = []
-    for csv_file in sorted(base_dir.rglob("trade_*.csv")):
+
+def transient_trade_error(exc: ApiError) -> bool:
+    message = str(exc).lower()
+    return (
+        "request failed for" in message
+        or "connection" in message
+        or "timeout" in message
+        or "timed out" in message
+        or "failed after retries: http 429" in message
+        or bool(re.search(r"failed after retries: http 5\d\d", message))
+    )
+
+
+def connection_reset_hint(exc: Exception) -> str:
+    message = str(exc).lower()
+    if (
+        "connectionreseterror" in message
+        or "connection was reset" in message
+        or "forcibly closed by the remote host" in message
+        or "recv failure: connection was reset" in message
+    ):
+        return (
+            "Polymarket reset the HTTPS connection before returning an HTTP response. "
+            "This is usually an upstream/network/IP restriction or temporary edge failure; "
+            "retry later or from a different network if it persists."
+        )
+    return ""
+
+
+def fetch_trade_page_resilient(
+    client: PolymarketClient,
+    wallet: str,
+    cfg: AnalyzerConfig,
+    *,
+    page_limit: int,
+    offset: int,
+) -> Tuple[List[Dict[str, Any]], int]:
+    min_page_limit = max(25, min(100, page_limit))
+    while True:
+        retry_count = cfg.max_retries if page_limit <= min_page_limit else min(2, cfg.max_retries)
         try:
-            with csv_file.open("r", newline="", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                rows.extend(dict(row) for row in reader)
-        except OSError:
-            continue
+            batch = client.get_json(
+                DATA_BASE,
+                "/trades",
+                {
+                    "user": wallet,
+                    "takerOnly": False,
+                    "limit": page_limit,
+                    "offset": offset,
+                },
+                max_retries=retry_count,
+            )
+        except ApiError as exc:
+            if page_limit > min_page_limit and transient_trade_error(exc):
+                next_limit = max(min_page_limit, page_limit // 2)
+                print(
+                    (
+                        f"    trades for {wallet}: request failed at offset {offset}; "
+                        f"retrying with page size {next_limit} instead of {page_limit}"
+                    ),
+                    file=sys.stderr,
+                )
+                page_limit = next_limit
+                continue
+            raise
+        if not isinstance(batch, list):
+            raise ApiError(f"Expected list from /trades, got {type(batch).__name__}")
+        return batch, page_limit
+
+
+def fetch_user_trades_full(
+    client: PolymarketClient,
+    wallet: str,
+    cfg: AnalyzerConfig,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    offset = 0
+    page_limit = max(1, cfg.trades_page_limit)
+
+    while offset <= cfg.trades_max_offset:
+        try:
+            batch, page_limit = fetch_trade_page_resilient(
+                client,
+                wallet,
+                cfg,
+                page_limit=page_limit,
+                offset=offset,
+            )
+        except ApiError as exc:
+            message = str(exc)
+            if "max historical activity offset" in message:
+                print(
+                    f"Pagination cap reached for /trades at offset {offset}. Retrieved {len(rows)} rows. "
+                    "The Polymarket API does not expose older rows beyond this limit.",
+                    file=sys.stderr,
+                )
+                return rows
+            raise
+
+        rows.extend(batch)
+        page_number = (offset // page_limit) + 1 if page_limit > 0 else 1
+        print(
+            f"    trades for {wallet}: page {page_number} returned {len(batch)} rows "
+            f"({len(rows)} total so far, page_size={page_limit})",
+            file=sys.stderr,
+        )
+        if len(batch) < page_limit:
+            return rows
+
+        offset += page_limit
+
+    print(
+        f"Pagination cap reached for /trades. Retrieved {len(rows)} rows. "
+        "A very active user may need archival/on-chain data for completeness.",
+        file=sys.stderr,
+    )
     return rows
 
 
@@ -302,20 +360,16 @@ def fetch_user_trades_incremental(
     """Fetch newest trade pages until a page contains no unseen trades."""
     rows: List[Dict[str, Any]] = []
     offset = 0
+    page_limit = max(1, cfg.trades_page_limit)
 
     while offset <= cfg.trades_max_offset:
-        batch = client.get_json(
-            DATA_BASE,
-            "/trades",
-            {
-                "user": wallet,
-                "takerOnly": False,
-                "limit": cfg.trades_page_limit,
-                "offset": offset,
-            },
+        batch, page_limit = fetch_trade_page_resilient(
+            client,
+            wallet,
+            cfg,
+            page_limit=page_limit,
+            offset=offset,
         )
-        if not isinstance(batch, list):
-            raise ApiError(f"Expected list from /trades, got {type(batch).__name__}")
         if not batch:
             break
 
@@ -331,15 +385,15 @@ def fetch_user_trades_incremental(
                 seen_uids.add(uid)
             unseen_in_batch += 1
 
-        page_number = (offset // cfg.trades_page_limit) + 1 if cfg.trades_page_limit > 0 else 1
+        page_number = (offset // page_limit) + 1 if page_limit > 0 else 1
         print(
-            f"    trades for {wallet}: page {page_number} unseen={unseen_in_batch}",
+            f"    trades for {wallet}: page {page_number} unseen={unseen_in_batch} page_size={page_limit}",
             file=sys.stderr,
         )
 
-        if unseen_in_batch == 0 or len(batch) < cfg.trades_page_limit:
+        if unseen_in_batch == 0 or len(batch) < page_limit:
             break
-        offset += cfg.trades_page_limit
+        offset += page_limit
 
     rows.sort(key=lambda r: to_unix_seconds(r.get("timestamp")) or -1.0)
     return rows
@@ -471,26 +525,44 @@ def download_for_user(
     cache = MetadataCache()
 
     wallet, profile = resolve_user_to_wallet(client, user)
-    key = user_key(user)
+    key = user_key(wallet or user)
+    existing_profile = sqlite_load_user_profile_row(data_dir, key)
+    profile_name = non_wallet_text(profile.get("name")) or non_wallet_text(existing_profile.get("name"))
+    profile_pseudonym = non_wallet_text(profile.get("pseudonym")) or non_wallet_text(existing_profile.get("pseudonym"))
+    profile_display = profile_name or profile_pseudonym
 
     print(f"Resolved {user} to wallet {wallet}", file=sys.stderr)
+    sqlite_upsert_user_alias(
+        data_dir,
+        user,
+        key,
+        display_name=profile_display or ("" if wallet_like(user) else user),
+        source="user_update",
+    )
+    sqlite_upsert_user_profile(
+        data_dir,
+        key,
+        {
+            "input_user": user,
+            "user_key": key,
+            "wallet": wallet,
+            "profile_name": profile_name,
+            "profile_pseudonym": profile_pseudonym,
+            "name": profile_name,
+            "pseudonym": profile_pseudonym,
+            "referral": non_wallet_text(profile.get("referral")) or non_wallet_text(existing_profile.get("referral")),
+        },
+    )
 
     existing_trade_uids = load_existing_trade_uids(data_dir, key)
     if existing_trade_uids:
-        print(f"Found {len(existing_trade_uids)} existing cached trade UIDs", file=sys.stderr)
+        print(f"Found {len(existing_trade_uids)} existing stored trade UIDs", file=sys.stderr)
 
     if force_trades_refresh or not existing_trade_uids:
-        trades = fetch_paginated(
+        trades = fetch_user_trades_full(
             client,
-            DATA_BASE,
-            "/trades",
-            {
-                "user": wallet,
-                "takerOnly": False,
-            },
-            limit=cfg.trades_page_limit,
-            max_offset=cfg.trades_max_offset,
-            progress_label=f"trades for {wallet}",
+            wallet,
+            cfg,
         )
         print(f"Fetched {len(trades)} trades from API", file=sys.stderr)
     else:
@@ -506,17 +578,17 @@ def download_for_user(
     if new_trades:
         print(f"Identified {len(new_trades)} new trades to write", file=sys.stderr)
     else:
-        print("No new trades found; all trades already cached", file=sys.stderr)
+        print("No new trades found; all trades already stored", file=sys.stderr)
 
     trades_to_process = list(trades)
     if existing_trade_uids and (force_market_refresh or force_price_refresh) and not force_trades_refresh:
-        cached_trades = load_cached_trade_rows(data_dir, key)
-        cached_uids = {trade_uid(t) for t in cached_trades if trade_uid(t)}
-        appended_new = [t for t in trades if trade_uid(t) not in cached_uids]
-        trades_to_process = cached_trades + appended_new
+        stored_trades = load_stored_trade_rows(data_dir, key)
+        stored_uids = {trade_uid(t) for t in stored_trades if trade_uid(t)}
+        appended_new = [t for t in trades if trade_uid(t) not in stored_uids]
+        trades_to_process = stored_trades + appended_new
         print(
             (
-                f"Loaded {len(cached_trades)} cached trades for forced metadata/price refresh; "
+                f"Loaded {len(stored_trades)} stored trades for forced metadata/price refresh; "
                 f"processing {len(trades_to_process)} trade rows"
             ),
             file=sys.stderr,
@@ -558,46 +630,33 @@ def download_for_user(
                 start_ts, end_ts = asset_time_ranges[asset]
                 asset_time_ranges[asset] = (min(start_ts, ts), max(end_ts, ts))
 
-    user_profile_path = data_dir / "user" / key / "profile.csv"
-    write_csv(
-        user_profile_path,
-        [
-            {
-                "input_user": user,
-                "user_key": key,
-                "wallet": wallet,
-                "profile_name": profile.get("name") or "",
-                "profile_pseudonym": profile.get("pseudonym") or "",
-            }
-        ],
+    sqlite_upsert_user_profile(
+        data_dir,
+        key,
+        {
+            "input_user": user,
+            "user_key": key,
+            "wallet": wallet,
+            "profile_name": profile.get("name") or "",
+            "profile_pseudonym": profile.get("pseudonym") or "",
+        },
     )
 
-    trade_files_written = write_monthly_record_files(
-        data_dir / "user" / key / "trades",
-        dict(user_trade_rows_by_month),
-        prefix="trade",
-        key_fields=("trade_record_key", "id", "transactionHash"),
-        overwrite=force_trades_refresh,
+    trade_rows_to_write = [row for rows in user_trade_rows_by_month.values() for row in rows]
+    trade_rows_written = sqlite_upsert_user_trades(
+        data_dir,
+        key,
+        trade_rows_to_write if not force_trades_refresh else trades_to_process,
+        replace_user=force_trades_refresh,
     )
-    print(f"Wrote {trade_files_written} new trade files", file=sys.stderr)
+    print(f"Wrote {trade_rows_written} user trade rows to SQLite", file=sys.stderr)
 
     condition_ids = sorted(condition_months.keys())
-    markets_dir = data_dir / "market" / "markets"
     if force_market_refresh:
         condition_ids_to_fetch = condition_ids
     else:
-        condition_ids_to_fetch = []
-        for condition_id in condition_ids:
-            months = condition_months.get(condition_id) or set()
-            record_key = sanitize_file_component(condition_id)
-            needs_fetch = False
-            for month in months:
-                out_path = record_file_path(markets_dir, month, "market", record_key)
-                if not out_path.exists():
-                    needs_fetch = True
-                    break
-            if needs_fetch:
-                condition_ids_to_fetch.append(condition_id)
+        stored_market_ids = sqlite_market_condition_ids(data_dir)
+        condition_ids_to_fetch = [condition_id for condition_id in condition_ids if condition_id not in stored_market_ids]
 
     markets: Dict[str, Dict[str, Any]] = {}
     if condition_ids_to_fetch:
@@ -607,9 +666,9 @@ def download_for_user(
             file=sys.stderr,
         )
     else:
-        print("Skipped market metadata API calls (all market files already present)", file=sys.stderr)
+        print("Skipped market metadata API calls (all market rows already present)", file=sys.stderr)
 
-    market_rows_by_month: DefaultDict[str, List[Dict[str, Any]]] = defaultdict(list)
+    market_rows: List[Dict[str, Any]] = []
     for condition_id in condition_ids_to_fetch:
         market = markets.get(condition_id)
         if not market:
@@ -617,18 +676,11 @@ def download_for_user(
 
         market_row = flatten_market_row(market)
         market_row["conditionId"] = condition_id
-        for month in sorted(condition_months.get(condition_id) or []):
-            market_rows_by_month[month].append(market_row)
+        market_rows.append(market_row)
 
-    market_files_written = write_monthly_record_files(
-        markets_dir,
-        dict(market_rows_by_month),
-        prefix="market",
-        key_fields=("conditionId", "slug", "eventSlug"),
-        overwrite=force_market_refresh,
-    )
-    if market_files_written:
-        print(f"Wrote {market_files_written} market files", file=sys.stderr)
+    market_rows_written = sqlite_upsert_markets(data_dir, market_rows)
+    if market_rows_written:
+        print(f"Wrote {market_rows_written} market rows to SQLite", file=sys.stderr)
 
     latest_trade_ts = max(
         (ts for ts in (to_unix_seconds(t.get("timestamp")) for t in trades_to_process) if ts is not None),
@@ -641,8 +693,8 @@ def download_for_user(
         "trades_seen_in_last_update": len(trades),
         "trades_processed_for_related_data": len(trades_to_process),
         "new_trades_written": len(new_trades),
-        "trade_files_written": trade_files_written,
-        "market_files_written": market_files_written,
+        "trade_rows_written": trade_rows_written,
+        "market_rows_written": market_rows_written,
         "price_history_skipped": bool(skip_price_history),
         "force_trades_refresh": bool(force_trades_refresh),
         "force_market_refresh": bool(force_market_refresh),
@@ -671,7 +723,6 @@ def download_for_user(
         lambda: defaultdict(list)
     )
 
-    price_history_root = data_dir / "market" / "prices-history"
     assets = sorted(asset_time_ranges.keys())
     fetched_assets = 0
     skipped_assets = 0
@@ -683,9 +734,8 @@ def download_for_user(
 
         missing_months: List[str] = []
         for month in traded_months:
-            file_name = f"price_history_asset_{sanitize_file_component(asset, 'asset')}.csv"
-            out_path = price_history_root / month / file_name
-            if force_price_refresh or not out_path.exists():
+            start_ts, end_ts = month_bounds_utc(month)
+            if force_price_refresh or not sqlite_price_history_cached(data_dir, asset, start_ts, end_ts):
                 missing_months.append(month)
 
         if not missing_months:
@@ -760,18 +810,13 @@ def download_for_user(
                 file=sys.stderr,
             )
 
-    price_files_written = 0
-    for month, rows_by_asset in sorted(price_rows_by_month_asset.items()):
-        month_dir = data_dir / "market" / "prices-history" / month
-        for asset, rows in sorted(rows_by_asset.items()):
-            out_path = month_dir / f"price_history_asset_{sanitize_file_component(asset, 'asset')}.csv"
-            if out_path.exists() and not force_price_refresh:
-                continue
-            write_csv(out_path, [csv_safe_row(r) for r in rows])
-            price_files_written += 1
+    price_rows_written = 0
+    for _month, rows_by_asset in sorted(price_rows_by_month_asset.items()):
+        for _asset, rows in sorted(rows_by_asset.items()):
+            price_rows_written += sqlite_upsert_price_history(data_dir, rows)
 
     print(
-        f"Wrote {price_files_written} price-history files; skipped {skipped_assets} cached assets",
+        f"Wrote {price_rows_written} price-history rows; skipped {skipped_assets} stored assets",
         file=sys.stderr,
     )
     update_watermark(
@@ -780,57 +825,50 @@ def download_for_user(
         key,
         {
             "price_history_skipped": False,
-            "price_files_written": price_files_written,
+            "price_rows_written": price_rows_written,
             "price_assets_fetched": fetched_assets,
-            "price_assets_skipped_cached": skipped_assets,
+            "price_assets_skipped_stored": skipped_assets,
         },
     )
 
 
 def main() -> None:
     args = parse_args()
-    cfg = AnalyzerConfig(sleep_between_requests=args.sleep)
+    cfg = AnalyzerConfig(
+        sleep_between_requests=args.sleep,
+        timeout_seconds=args.timeout_seconds,
+        max_retries=args.max_retries,
+        trades_page_limit=args.trades_page_limit,
+        trades_max_offset=args.trades_max_offset,
+    )
     data_dir = Path(args.data_dir)
+    ensure_database(data_dir)
+    requested_users = collect_requested_users(args.user, args.users_file)
 
-    if not args.user and not args.no_seed_from_candidates:
+    if not requested_users and not args.no_seed_from_candidates:
         accepted_confidences = parse_confidence_levels(args.candidate_confidences)
-        created, existing = seed_user_dirs_from_candidates(
-            data_dir,
-            Path(args.candidates_csv),
-            accepted_confidences,
-        )
-        if created or existing:
+        requested_users = sqlite_candidate_wallets(data_dir, accepted_confidences)
+        if requested_users:
             print(
                 (
-                    f"Auto-seeded users from {args.candidates_csv}: "
-                    f"created={created}, already_present={existing}, "
-                    f"confidences={','.join(sorted(accepted_confidences))}"
+                    f"Auto-selected {len(requested_users)} candidate users from SQLite "
+                    f"with confidences={','.join(sorted(accepted_confidences))}"
                 ),
                 file=sys.stderr,
             )
         else:
             print(
                 (
-                    f"No users auto-seeded from {args.candidates_csv}. "
-                    "Run market_scanner.py first or adjust --candidate-confidences."
+                    "No users auto-selected from SQLite scanner candidates. "
+                    "Run analyze scanner first or adjust --candidate-confidences."
                 ),
                 file=sys.stderr,
             )
 
-    if args.user:
-        users = [u.strip() for u in args.user if str(u).strip()]
+    if requested_users:
+        users = requested_users
     else:
-        users_dir = data_dir / "user"
-        if not users_dir.exists():
-            print(
-                (
-                    "ERROR: No --user provided and no users discovered under "
-                    f"{users_dir}. Create user folders there or pass --user."
-                ),
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        users = sorted([p.name for p in users_dir.iterdir() if p.is_dir()])
+        users = sqlite_list_user_keys(data_dir, include_candidates=True)
 
     if not users:
         print("ERROR: No users to process.", file=sys.stderr)
@@ -854,6 +892,9 @@ def main() -> None:
         except Exception as exc:
             failures += 1
             print(f"ERROR processing user {user}: {exc}", file=sys.stderr)
+            hint = connection_reset_hint(exc)
+            if hint:
+                print(f"  Hint: {hint}", file=sys.stderr)
 
     if failures:
         print(f"Done with {failures} failure(s). Wrote data under: {data_dir.resolve()}", file=sys.stderr)
